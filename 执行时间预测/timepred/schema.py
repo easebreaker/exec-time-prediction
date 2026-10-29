@@ -9,14 +9,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-BLOCK_KINDS = ("embedding", "cross", "attention", "ffn", "expert")
+BLOCK_KINDS = ("embedding", "cross", "attention", "token_mixer", "ffn", "expert")
 SPLIT_KINDS = ("none", "dp", "tp", "pp", "ep", "embp", "cp")
 # 与修订稿里的对应关系：切分只改它切得到的那类张量。
 SPLIT_BLOCK_KINDS = {
     "none": BLOCK_KINDS,
     "dp": BLOCK_KINDS,
-    "tp": ("attention", "ffn", "cross"),
-    "pp": ("attention", "ffn", "expert", "cross"),
+    "tp": ("attention", "ffn", "cross", "token_mixer"),
+    "pp": ("attention", "ffn", "expert", "cross", "token_mixer"),
     "ep": ("expert",),
     "embp": ("embedding",),
     "cp": ("attention",),
@@ -114,6 +114,7 @@ class Load:
     lengths: Mapping[str, int]
     n_ids: Mapping[str, int] | None = None
     expert_frac: float = 1.0
+    n_groups: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.batch < 1:
@@ -122,20 +123,26 @@ class Load:
             raise FrameworkError("expert 实际执行份额要在 0 到 1 之间")
         lengths = dict(self.lengths)
         n_ids = dict(self.n_ids or {})
+        n_groups = dict(self.n_groups or {})
         for name, length in lengths.items():
             if length < 1:
                 raise FrameworkError(f"{name} 的序列长度至少为 1")
         for name, count in n_ids.items():
             if count < 1:
                 raise FrameworkError(f"{name} 的 id 数至少为 1")
+        for name, groups in n_groups.items():
+            if groups < 1:
+                raise FrameworkError(f"{name} 的组数至少为 1")
         object.__setattr__(self, "lengths", lengths)
         object.__setattr__(self, "n_ids", n_ids)
+        object.__setattr__(self, "n_groups", n_groups)
 
     def key(self) -> tuple:
         """同一长度、同一 batch 的各次切分属于同一负载组合。"""
         lengths = tuple(sorted(self.lengths.items()))
         n_ids = tuple(sorted(self.n_ids.items()))
-        return (self.batch, self.expert_frac, lengths, n_ids)
+        n_groups = tuple(sorted(self.n_groups.items()))
+        return (self.batch, self.expert_frac, lengths, n_ids, n_groups)
 
 
 @dataclass(frozen=True)
@@ -199,6 +206,7 @@ _KIND_LABEL = {
     "embedding": "查表",
     "cross": "交叉",
     "attention": "注意力",
+    "token_mixer": "token mixer",
     "ffn": "FFN",
     "expert": "Expert",
 }

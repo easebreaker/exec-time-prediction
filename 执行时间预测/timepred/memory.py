@@ -53,6 +53,8 @@ def _kv_bytes(block: BlockSpec, load: Load, split: Split, elem_bytes: int) -> in
 def _activation_bytes(block: BlockSpec, load: Load, split: Split, elem_bytes: int) -> int:
     if block.kind in ("embedding", "cross"):
         count = load.n_ids[block.name]
+    elif block.kind == "token_mixer":
+        count = load.n_groups[block.name] * load.lengths[block.name]
     else:
         count = load.lengths[block.name]
     total = block.n_layers * load.batch * count * block.d_model * elem_bytes

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from timepred.baseline import BlockBaseline
+from timepred.baseline import BlockBaseline, features
 from timepred.evaluate import evaluate
 from timepred.fit import fit
 from timepred.formula import compute_speedup, linear_cut, slide_time
@@ -36,6 +36,29 @@ def assert_rel(test: unittest.TestCase, got: float, expected: float) -> None:
         1e-4 * scale + 1e-12,
         msg=f"{got} != {expected}",
     )
+
+
+class ComplexityTests(unittest.TestCase):
+    def test_token_mixer_uses_groups_and_tokens_not_sequence_length(self) -> None:
+        block = BlockSpec("mixer", "token_mixer", d_model=4)
+        short = Load(2, {"mixer": 8, "attn": 512}, n_groups={"mixer": 3})
+        long = Load(2, {"mixer": 8, "attn": 8192}, n_groups={"mixer": 3})
+        self.assertEqual(features(block, short), [2 * 3 * 8 * 8 * 4, 1.0])
+        self.assertEqual(features(block, short), features(block, long))
+
+    def test_context_parallel_does_not_apply_to_token_mixer(self) -> None:
+        spec = ModelSpec(
+            blocks=(BlockSpec("mixer", "token_mixer", d_model=4),),
+            capacity_bytes=10**9,
+        )
+        model = TimeModel(
+            spec,
+            {"mixer": BlockBaseline((1e-6, 0.0))},
+            {},
+        )
+        load = Load(1, {"mixer": 16}, n_groups={"mixer": 2})
+        with self.assertRaises(FrameworkError):
+            model.predict(load, Plan({"mixer": Split("cp", 2)}))
 
 
 class FormulaTests(unittest.TestCase):

@@ -2,6 +2,7 @@
 
 列：batch, time_s, peak_mem_bytes, expert_frac, plan，
 以及每个块的 len_<块名>、ids_<块名>、t_<块名>。
+token mixer 另有 groups_<块名>，是组数 R。len_<块名> 对它是组内 token 数 T。
 
 plan 的写法是块名=切分:并行度，多块用分号隔开。对照写 none。
 流水并行写成 attention=pp:4:32，最后一段是 micro-batch 数。
@@ -21,6 +22,8 @@ def headers(spec: ModelSpec) -> list[str]:
     for block in spec.blocks:
         columns.append(f"len_{block.name}")
         columns.append(f"ids_{block.name}")
+        if block.kind == "token_mixer":
+            columns.append(f"groups_{block.name}")
         columns.append(f"t_{block.name}")
     return columns
 
@@ -102,6 +105,7 @@ def _row_to_sample(spec: ModelSpec, row: dict[str, str | None], line_number: int
         raise FrameworkError(f"第 {line_number} 行的 expert_frac 无法解析") from exc
     lengths: dict[str, int] = {}
     n_ids: dict[str, int] = {}
+    n_groups: dict[str, int] = {}
     block_times: dict[str, float] = {}
     for block in spec.blocks:
         length = _optional_int(_cell(row, f"len_{block.name}"), f"len_{block.name}")
@@ -110,6 +114,9 @@ def _row_to_sample(spec: ModelSpec, row: dict[str, str | None], line_number: int
         ids = _optional_int(_cell(row, f"ids_{block.name}"), f"ids_{block.name}")
         if ids is not None:
             n_ids[block.name] = ids
+        groups = _optional_int(_cell(row, f"groups_{block.name}"), f"groups_{block.name}")
+        if groups is not None:
+            n_groups[block.name] = groups
         segment = _optional_float(_cell(row, f"t_{block.name}"), f"t_{block.name}")
         if segment is not None:
             block_times[block.name] = segment
@@ -118,7 +125,7 @@ def _row_to_sample(spec: ModelSpec, row: dict[str, str | None], line_number: int
         plan = parse_plan(_cell(row, "plan") or "none")
         ensure_plan(spec, plan)
         return Sample(
-            load=Load(batch, lengths, n_ids, expert_frac),
+            load=Load(batch, lengths, n_ids, expert_frac, n_groups),
             plan=plan,
             time_s=time_s,
             block_times_s=block_times or None,

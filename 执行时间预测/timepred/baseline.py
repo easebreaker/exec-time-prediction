@@ -21,12 +21,24 @@ class BlockBaseline:
 
 
 def features(block: BlockSpec, load: Load) -> list[float]:
-    """复杂度按块写死，只估系数。
+    """各块的计算量。层数写在块上，不随样本变化，收进系数，不出现在特征里。
 
-    查表、交叉：(B · n_id, 1)
-    注意力：(B · L^2 · d, B · L · d, 1)。平方项是 score，线性项是 KV。
-    FFN：(B · L · d, 1)
-    Expert：在 FFN 的形式上乘该步实际执行的 expert 份额。
+    符号只表示该块真正读到的量。用户序列长度记为 L，只进入注意力。
+    token mixer 的平方维是组内 token 数 T，不读 L。
+
+    查表、交叉：B · n_id
+        B 是 batch。n_id 是该块查询的 id 数。与 L、T 无关。
+    注意力：B · L² · d ，以及 B · L · d
+        L 是该注意力看到的序列长度。d 是 d_model。
+        第一项是 score，第二项是 KV。
+    token mixer：B · R · T² · d
+        T 是一组里被混合的 token 数。R 是这样的组数。
+        d 是 d_model。长序列长度 L 不进入这一项。
+    FFN：B · N_tok · d
+        N_tok 是该 FFN 看到的 token 数。隐层宽度收进系数。
+        接在 mixer 后面时，N_tok 取 T，不取 L。
+    Expert：s · B · N_tok · d
+        s 是该步实际执行的 expert 份额。其余与 FFN 相同。
     """
     batch = float(load.batch)
     width = float(block.d_model)
@@ -34,6 +46,14 @@ def features(block: BlockSpec, load: Load) -> list[float]:
         if block.name not in load.n_ids:
             raise FrameworkError(f"{block.name} 缺少 id 数")
         return [batch * float(load.n_ids[block.name]), 1.0]
+    if block.kind == "token_mixer":
+        if block.name not in load.n_groups:
+            raise FrameworkError(f"{block.name} 缺少组数 R")
+        if block.name not in load.lengths:
+            raise FrameworkError(f"{block.name} 缺少组内 token 数 T")
+        groups = float(load.n_groups[block.name])
+        tokens = float(load.lengths[block.name])
+        return [batch * groups * tokens * tokens * width, 1.0]
     if block.name not in load.lengths:
         raise FrameworkError(f"{block.name} 缺少序列长度")
     length = float(load.lengths[block.name])

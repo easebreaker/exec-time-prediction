@@ -3,15 +3,23 @@
 v 的单位是秒/字节，把未被掩盖的有效带宽合在里面。换机器后 v 要重估。
 体积若整体差一个常数倍，会被 v 吸收；随长度、batch、并行度变化的那一部分不会。
 
+下面的 L 只出现在注意力和按序列走的激活里，是该注意力的序列长度。
+token mixer 的激活用 R · T，不用 L。n_layers 是层数，不写成 L。
+
 - CP：注意力输出 All-Gather。Query 按位置切开，KV 不切，每层一次。
   ((N - 1) / N) · n_layers · B · L · d · elem
+  N 是并行度，B 是 batch，d 是 d_model，elem 是元素字节数。
 - EmbP：查出的嵌入做 All-to-All。
-  ((N - 1) / N^2) · B · n_ids · d · elem · n_layers
+  ((N - 1) / N²) · B · n_id · d · elem · n_layers
+  n_id 是查询的 id 数。
 - TP：稠密矩阵的激活同步。注意力和 FFN 都切时每层两次，只切其中一段时每层一次。
   环状 AllReduce 为 2 · ((N - 1) / N) · 激活字节。
+  激活字节里，注意力和 FFN 用 B · N_tok · d，token mixer 用 B · R · T · d。
 - EP：dispatch 与 combine 各一次 All-to-All。
-  2 · ((N - 1) / N^2) · B · L · d · elem · n_layers
-- PP：相邻 stage 的点对点激活。(S - 1) · B · L · d · elem
+  2 · ((N - 1) / N²) · B · N_tok · d · elem · n_layers
+  N_tok 是送进 Expert 的 token 数。
+- PP：相邻 stage 的点对点激活。(S - 1) · B · N_tok · d · elem
+  S 是 stage 数。
 """
 
 from __future__ import annotations
@@ -22,6 +30,8 @@ from .schema import BlockSpec, FrameworkError, Load, Split
 def _tokens(block: BlockSpec, load: Load) -> float:
     if block.kind in ("embedding", "cross"):
         return float(load.n_ids[block.name])
+    if block.kind == "token_mixer":
+        return float(load.n_groups[block.name]) * float(load.lengths[block.name])
     return float(load.lengths[block.name])
 
 
