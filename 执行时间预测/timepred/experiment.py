@@ -1,7 +1,8 @@
 """按阶段做的三组实验：复杂度、切分加速比、通信。
 
 复杂度实验只用未切分的运行。一次只动一个轴，从固定的单项里做相对误差的
-非负最小二乘。多出来的一项必须把误差明显降下来才保留。
+非负最小二乘。多出来的一项必须把误差明显降下来才保留。误差打平时留下标称
+算子的主项，避免和 batch 成比例的 lookup 把 L² 或转置换掉。
 
 切分实验一次只拟合一种切分。κ 和 v 在样本里成比例时标成没有分开，
 仍给出一组能对上时间的数，但不把它们当成各自的物理量。
@@ -23,6 +24,7 @@ from .stage import (
     StageLoad,
     StageSpec,
     StageSplit,
+    _LOAD_FIELDS,
     compute_parts,
     default_load,
     features,
@@ -78,6 +80,9 @@ class SplitReport:
     train_mape: float
     volume_matches: bool | None
     reason: str
+    # 样本里只有一个并行度时记下来，预测可以不再另传 plan。多个并行度时为空。
+    degree: int | None = None
+    n_microbatches: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +95,7 @@ class StageEstimate:
     speedup_upper_bound: float
     identified: bool
     overlap: bool
+    split: StageSplit
 
 
 @dataclass(frozen=True)
@@ -125,9 +131,25 @@ def stage_time(
     return total, compute, comm
 
 
+_BOUND_GRIDS = {
+    "length": (128, 256, 512, 1024, 2048, 4096),
+    "tokens": (4, 8, 16, 32),
+    "groups": (1, 2, 4, 8),
+    "n_query": (1, 2, 4, 8, 16),
+    "length_kv": (128, 512, 2048),
+    "n_id": (16, 64, 256, 1024),
+    "n_head": (1, 2, 4, 8),
+    "width": (32, 64, 128, 256),
+}
+
+
 def complexity_grid(spec: StageSpec, base: StageLoad | None = None) -> list[StageLoad]:
-    """每个轴单独取一串倍数。长度轴始终在里面，用来判断该阶段读不读 L。"""
-    base = base or default_load()
+    """每个轴单独取一串倍数。长度轴始终在里面，用来判断该阶段读不读用户序列 L。
+
+    接到 extras 上的轴会补上默认值并单独扫描。否则 boost 的 token 数不随
+    tokens 列变化，转置项和 lookup 在样本里分不开。
+    """
+    base = _seed_bound_axes(spec, base or default_load())
     loads = [base]
     for batch in (1, 2, 4, 8):
         _push(loads, base.varied(batch=batch))
@@ -160,6 +182,7 @@ def complexity_grid(spec: StageSpec, base: StageLoad | None = None) -> list[Stag
     for key, value in base.extras.items():
         for factor in (2, 4, 8):
             _push(loads, base.varied(extras={key: value * factor}))
+    _sweep_bound_axes(spec, base, loads)
     return loads
 
 
@@ -181,10 +204,17 @@ def fit_complexity(spec: StageSpec, observations: list[StageObservation]) -> Com
             fitted.append((coefficients, mape))
     if not fitted:
         raise FrameworkError(f"{spec.name} 的复杂度没有可用的拟合")
+    # 误差打平时保留标称主项。与 batch 成比例时，按名字会先选到
+    # cross_attn、lookup，长序列上的 L² 或 boost 的转置就被换成常数。
+    primary = PRIMARY_TERM[spec.operator]
     best_mape = min(mape for _, mape in fitted)
-    tolerance = best_mape + max(0.05 * best_mape, 1e-4)
-    close = [item for item in fitted if item[1] <= tolerance]
-    coefficients, mape = min(close, key=lambda item: (len(item[0]), item[1], tuple(item[0])))
+    declared = [item for item in fitted if primary in item[0] and item[1] <= best_mape + 1e-4]
+    if declared:
+        pool = declared
+    else:
+        tolerance = best_mape + max(0.05 * best_mape, 1e-4)
+        pool = [item for item in fitted if item[1] <= tolerance]
+    coefficients, mape = min(pool, key=lambda item: (len(item[0]), item[1], tuple(item[0])))
     rows = [[features(spec, load)[name] for name in coefficients] for load in loads] if coefficients else []
     identified = bool(coefficients) and column_rank(rows) == len(coefficients)
     matches = PRIMARY_TERM[spec.operator] in coefficients
@@ -284,6 +314,8 @@ def fit_split(
     if volume_matches is False:
         identified = False
         reason = "通信体积和公式不一致"
+    degrees = {obs.split.degree for obs in observations}
+    micros = {obs.split.n_microbatches for obs in observations}
     return SplitReport(
         pattern=pattern,
         kappa=kappa,
@@ -296,6 +328,8 @@ def fit_split(
         train_mape=train_mape,
         volume_matches=volume_matches,
         reason=reason,
+        degree=degrees.pop() if len(degrees) == 1 else None,
+        n_microbatches=micros.pop() if len(micros) == 1 else None,
     )
 
 
@@ -309,7 +343,7 @@ def predict_stage(
     coefficients = complexity.coefficients()
     unsplit, _, _ = stage_time(spec, coefficients, load, StageSplit("none"))
     if split.kind == "none":
-        return StageEstimate(unsplit, unsplit, 0.0, unsplit, 1.0, 1.0, True, False)
+        return StageEstimate(unsplit, unsplit, 0.0, unsplit, 1.0, 1.0, True, False, split)
     if split_fit is None or split_fit.pattern != split.kind:
         raise FrameworkError(f"{spec.name} 还没有 {SPLIT_LABEL[split.kind]} 的参数")
     total, compute, comm = stage_time(
@@ -337,6 +371,7 @@ def predict_stage(
         speedup_upper_bound=upper,
         identified=split_fit.identified and complexity.identified,
         overlap=split_fit.overlap,
+        split=split,
     )
 
 
@@ -347,15 +382,56 @@ def predict_network(
     load: StageLoad,
     plan: dict[str, StageSplit] | None = None,
 ) -> NetworkEstimate:
+    """按阶段相加。plan 里写了具体切分就用它；缺省或写了不切分时，用该阶段的拟合。
+
+    拟合只含一个并行度时，degree 来自样本。含多个并行度而又没在 plan 里
+    写明时直接报错，不再把切分悄悄当成 none。
+    """
     plan = plan or {}
     pieces: list[tuple[str, StageEstimate]] = []
     for spec in stages:
         if spec.name not in complexities:
             raise FrameworkError(f"{spec.name} 还没有复杂度")
-        split = plan.get(spec.name, StageSplit("none"))
         fit = split_fits.get(spec.name)
+        planned = plan.get(spec.name)
+        if fit is not None and (planned is None or planned.kind == "none"):
+            split = _split_from_report(spec, fit)
+        elif planned is not None:
+            split = planned
+        else:
+            split = StageSplit("none")
         pieces.append((spec.name, predict_stage(spec, complexities[spec.name], load, split, fit)))
     return NetworkEstimate(sum(piece.time_s for _, piece in pieces), tuple(pieces))
+
+
+def _seed_bound_axes(spec: StageSpec, base: StageLoad) -> StageLoad:
+    extras = {}
+    for role, field in spec.axes.items():
+        if field in _LOAD_FIELDS or field in base.extras or role not in _LOAD_FIELDS:
+            continue
+        extras[field] = int(getattr(base, role))
+    if not extras:
+        return base
+    return base.varied(extras=extras)
+
+
+def _sweep_bound_axes(spec: StageSpec, base: StageLoad, loads: list[StageLoad]) -> None:
+    for role, field in spec.axes.items():
+        if field in _LOAD_FIELDS or (role == "groups" and spec.groups_follow_length):
+            continue
+        for value in _BOUND_GRIDS.get(role, ()):
+            _push(loads, base.varied(extras={field: int(value)}))
+
+
+def _split_from_report(spec: StageSpec, fit: SplitReport) -> StageSplit:
+    if fit.pattern == "none":
+        return StageSplit("none")
+    if fit.degree is None or fit.n_microbatches is None:
+        label = SPLIT_LABEL[fit.pattern]
+        raise FrameworkError(
+            f"{spec.name} 的{label}拟合了多个并行度，预测时要在 plan 里写明切分"
+        )
+    return StageSplit(fit.pattern, fit.degree, fit.n_microbatches)
 
 
 def _push(loads: list[StageLoad], load: StageLoad) -> None:

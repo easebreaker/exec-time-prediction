@@ -122,6 +122,59 @@ class ComplexityTests(unittest.TestCase):
         self.assertAlmostEqual(linear_report.width_log_slope or 0.0, 2.0, places=2)
         self.assertFalse(permute_report.depends_on_length)
 
+    def test_batch_only_sweep_keeps_the_length_term(self) -> None:
+        spec = StageSpec("attn", "self_attn")
+        coefficients = {"self_attn": 2e-9, "intercept": 0.02}
+        loads = [default_load().varied(batch=batch) for batch in (1, 2, 4, 8)]
+        report = fit_complexity(spec, measure(spec, coefficients, loads, StageSplit("none")))
+        self.assertIn("self_attn", report.coefficients())
+        self.assertNotIn("lookup", report.coefficients())
+        self.assertNotIn("cross_attn", report.coefficients())
+        long = default_load().varied(length=8192)
+        truth, _, _ = stage_time(spec, coefficients, long, StageSplit("none"))
+        predicted, _, _ = stage_time(spec, report.coefficients(), long, StageSplit("none"))
+        assert_rel(self, predicted, truth)
+
+        cross = StageSpec("decode", "cross_attn")
+        cross_coef = {"cross_attn": 1e-8, "intercept": 0.01}
+        cross_report = fit_complexity(cross, measure(cross, cross_coef, loads, StageSplit("none")))
+        self.assertIn("cross_attn", cross_report.coefficients())
+        self.assertNotIn("lookup", cross_report.coefficients())
+        longer_kv = default_load().varied(length_kv=8192)
+        truth, _, _ = stage_time(cross, cross_coef, longer_kv, StageSplit("none"))
+        predicted, _, _ = stage_time(cross, cross_report.coefficients(), longer_kv, StageSplit("none"))
+        assert_rel(self, predicted, truth)
+
+    def test_proportional_ids_do_not_replace_permute(self) -> None:
+        spec = StageSpec("boost_mix", "token_permute", axes={"tokens": "boost_tokens"})
+        base = default_load().varied(extras={"boost_tokens": 16})
+        loads = []
+        for batch in (1, 2, 4, 8):
+            for tokens in (8, 16, 32):
+                loads.append(
+                    base.varied(
+                        batch=batch,
+                        n_id=tokens * base.width,
+                        extras={"boost_tokens": tokens},
+                    )
+                )
+        report = fit_complexity(spec, measure(spec, {"permute": 1e-6}, loads, StageSplit("none")))
+        self.assertTrue(report.matches_operator)
+        self.assertNotIn("lookup", report.coefficients())
+        shifted = base.varied(n_id=128, extras={"boost_tokens": 64})
+        truth, _, _ = stage_time(spec, {"permute": 1e-6}, shifted, StageSplit("none"))
+        predicted, _, _ = stage_time(spec, report.coefficients(), shifted, StageSplit("none"))
+        assert_rel(self, predicted, truth)
+
+    def test_bound_token_axis_is_swept_for_boost(self) -> None:
+        spec = StageSpec("boost_mix", "token_permute", axes={"tokens": "boost_tokens"})
+        loads = complexity_grid(spec)
+        values = {load.extras["boost_tokens"] for load in loads}
+        self.assertGreater(len(values), 1)
+        report = fit_complexity(spec, measure(spec, {"permute": 1e-6}, loads, StageSplit("none")))
+        self.assertTrue(report.matches_operator)
+        self.assertNotIn("lookup", report.coefficients())
+
 
 class SplitTests(unittest.TestCase):
     def test_query_split_recovers_kappa_tau_and_bandwidth(self) -> None:
@@ -148,6 +201,7 @@ class SplitTests(unittest.TestCase):
         assert_rel(self, report.kappa, 0.25)
         assert_rel(self, report.tau_s, 0.01)
         assert_rel(self, report.v_s_per_byte, 1e-6)
+        self.assertIsNone(report.degree)
         one_length = [obs for obs in observations if obs.load.length == 512]
         collapsed = fit_split(spec, complexity, one_length)
         self.assertFalse(collapsed.identified)
@@ -266,6 +320,77 @@ class NetworkTests(unittest.TestCase):
         attn_time, _, _ = stage_time(attn, attn_coef, load, split)
         assert_rel(self, network.time_s, embed_time + proj_time + attn_time)
         self.assertAlmostEqual(network.stages[2][1].speedup, 4.0, places=4)
+        self.assertEqual(network.stages[2][1].split.kind, "cp_q")
+        self.assertEqual(network.stages[0][1].split.kind, "none")
+
+    def test_fitted_split_is_used_when_the_plan_says_none(self) -> None:
+        embed, proj, attn = hstu_stages()
+        attn_coef = {"self_attn": 2e-9, "intercept": 0.02}
+        complexities = {
+            embed.name: fit_complexity(
+                embed,
+                measure(embed, {"lookup": 1e-5, "intercept": 0.01}, complexity_grid(embed), StageSplit("none")),
+            ),
+            proj.name: fit_complexity(
+                proj, measure(proj, {"linear": 1e-8}, complexity_grid(proj), StageSplit("none"))
+            ),
+            attn.name: fit_complexity(
+                attn, measure(attn, attn_coef, complexity_grid(attn), StageSplit("none"))
+            ),
+        }
+        loads = [default_load().varied(length=length) for length in (512, 2048)]
+        fitted = fit_split(
+            attn,
+            complexities[attn.name],
+            measure(
+                attn,
+                attn_coef,
+                loads,
+                StageSplit("cp_q", 4),
+                kappa=0.25,
+                tau_s=0.01,
+                v_s_per_byte=1e-6,
+            ),
+        )
+        self.assertEqual(fitted.degree, 4)
+        load = default_load()
+        network = predict_network((embed, proj, attn), complexities, {attn.name: fitted}, load)
+        self.assertEqual([piece.split.kind for _, piece in network.stages], ["none", "none", "cp_q"])
+        self.assertEqual(network.stages[2][1].split.degree, 4)
+        overridden = predict_network(
+            (embed, proj, attn),
+            complexities,
+            {attn.name: fitted},
+            load,
+            {attn.name: StageSplit("none")},
+        )
+        self.assertEqual(overridden.stages[2][1].split.kind, "cp_q")
+        mixed = []
+        for degree in (2, 4):
+            mixed.extend(
+                measure(
+                    attn,
+                    attn_coef,
+                    loads,
+                    StageSplit("cp_q", degree),
+                    kappa=0.25,
+                    tau_s=0.01,
+                    v_s_per_byte=1e-6,
+                )
+            )
+        several = fit_split(attn, complexities[attn.name], mixed)
+        self.assertIsNone(several.degree)
+        with self.assertRaises(FrameworkError):
+            predict_network((embed, proj, attn), complexities, {attn.name: several}, load)
+        explicit = predict_network(
+            (embed, proj, attn),
+            complexities,
+            {attn.name: several},
+            load,
+            {attn.name: StageSplit("cp_q", 4)},
+        )
+        self.assertEqual(explicit.stages[2][1].split.kind, "cp_q")
+        self.assertEqual(explicit.stages[2][1].split.degree, 4)
 
     def test_cross_attention_shards_the_key_length(self) -> None:
         spec = StageSpec("decode", "cross_attn")

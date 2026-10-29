@@ -101,7 +101,9 @@ def main() -> None:
     )
     print(
         "HSTU 三段相加，只切注意力: "
-        + "，".join(f"{name}={piece.time_s:.4f}s" for name, piece in network.stages)
+        + "，".join(
+            f"{name}={piece.time_s:.4f}s（{piece.split.kind}）" for name, piece in network.stages
+        )
         + f"，合计={network.time_s:.4f}s"
     )
 
