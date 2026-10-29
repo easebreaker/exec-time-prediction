@@ -13,6 +13,38 @@ def _norm(v: list[float]) -> float:
     return math.sqrt(dot(v, v))
 
 
+def column_rank(rows: list[list[float]]) -> int:
+    """列缩放后的数值秩。成比例的列只计一次。"""
+    if not rows:
+        return 0
+    width = len(rows[0])
+    if any(len(row) != width for row in rows):
+        raise ValueError("设计矩阵列数不一致")
+    scales = []
+    for column in range(width):
+        scales.append(_norm([row[column] for row in rows]) or 1.0)
+    columns = [
+        [row[column] / scales[column] for row in rows]
+        for column in range(width)
+    ]
+    basis: list[list[float]] = []
+    rank = 0
+    for column in columns:
+        residual = column[:]
+        for direction in basis:
+            projected = dot(direction, residual)
+            residual = [
+                value - projected * direction[index]
+                for index, value in enumerate(residual)
+            ]
+        norm = _norm(residual)
+        if norm <= 1e-8:
+            continue
+        basis.append([value / norm for value in residual])
+        rank += 1
+    return rank
+
+
 def _lstsq(rows: list[list[float]], targets: list[float]) -> list[float] | None:
     """列满秩时返回最小二乘解。列相关或样本少于参数时返回 None。"""
     n = len(rows)

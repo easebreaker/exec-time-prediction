@@ -6,6 +6,9 @@
    对照运行另填各块分段时间。
 3. load_samples 读入后，holdout_by_load 按 batch 和序列长度整组留出测试集。
 4. fit 只在训练集上估计参数。evaluate 只比较测试集的预测时间和实测时间。
+
+阶段实验是另一条路径：python3 -m timepred.stage_demo。
+一个模型拆成若干阶段，每个阶段单独识别计算量、切分加速比和通信。
 """
 
 from timepred.demo import main
