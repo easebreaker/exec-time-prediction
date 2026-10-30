@@ -175,6 +175,42 @@ class ComplexityTests(unittest.TestCase):
         self.assertTrue(report.matches_operator)
         self.assertNotIn("lookup", report.coefficients())
 
+    def test_tiny_scaled_coefficient_is_kept_for_the_primary_term(self) -> None:
+        spec = StageSpec("attn", "self_attn")
+        loads = complexity_grid(spec)
+        peak = max(features(spec, load)["self_attn"] for load in loads)
+        intercept = 0.05
+        coefficient = 0.2 * 1e-5 * intercept / peak
+        coefficients = {"self_attn": coefficient, "intercept": intercept}
+        report = fit_complexity(spec, measure(spec, coefficients, loads, StageSplit("none")))
+        self.assertIn("self_attn", report.coefficients())
+        heavy = default_load().varied(batch=128, length=65536, n_head=64, d_head=128, width=512, hidden=2048)
+        truth, _, _ = stage_time(spec, coefficients, heavy, StageSplit("none"))
+        predicted, _, _ = stage_time(spec, report.coefficients(), heavy, StageSplit("none"))
+        self.assertGreater(truth / intercept, 4.0)
+        assert_rel(self, predicted, truth)
+
+    def test_one_short_sample_does_not_flatten_the_stage(self) -> None:
+        spec = StageSpec("attn", "self_attn")
+        coefficients = {"self_attn": 2e-9, "intercept": 0.02}
+        loads = complexity_grid(spec)
+        observations = measure(spec, coefficients, loads, StageSplit("none"))
+        peak_index = max(
+            range(len(observations)),
+            key=lambda index: features(spec, observations[index].load)["self_attn"],
+        )
+        median = sorted(obs.time_s for obs in observations)[len(observations) // 2]
+        observations[peak_index] = StageObservation(
+            observations[peak_index].load,
+            StageSplit("none"),
+            median * 1e-4,
+        )
+        report = fit_complexity(spec, observations)
+        self.assertIn("self_attn", report.coefficients())
+        truth, _, _ = stage_time(spec, coefficients, default_load(), StageSplit("none"))
+        predicted, _, _ = stage_time(spec, report.coefficients(), default_load(), StageSplit("none"))
+        self.assertLess(abs(predicted - truth) / truth, 0.05)
+
 
 class SplitTests(unittest.TestCase):
     def test_query_split_recovers_kappa_tau_and_bandwidth(self) -> None:

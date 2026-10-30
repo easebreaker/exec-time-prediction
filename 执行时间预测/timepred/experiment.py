@@ -200,7 +200,7 @@ def fit_complexity(spec: StageSpec, observations: list[StageObservation]) -> Com
             continue
         names = [eligible[index] for index in range(len(eligible)) if mask & (1 << index)]
         coefficients, mape = _fit_terms(spec, loads, times, names)
-        if math.isfinite(mape):
+        if math.isfinite(mape) and coefficients:
             fitted.append((coefficients, mape))
     if not fitted:
         raise FrameworkError(f"{spec.name} 的复杂度没有可用的拟合")
@@ -454,7 +454,9 @@ def _mape(predicted: list[float], measured: list[float]) -> float:
     for pred, truth in zip(predicted, measured):
         if truth <= 0.0:
             raise FrameworkError("实验时间要为正")
-        total += abs(pred - truth) / truth
+        # 单点相对误差封顶，否则一条极短样本的误差能到 1e6，
+        # 预测成 0 的空模型（误差恰好为 1）会反而胜出。
+        total += min(abs(pred - truth) / truth, 10.0)
     return total / len(measured)
 
 
@@ -480,10 +482,17 @@ def _fit_terms(
         return {}, math.inf
     theta = fit_relative_linear(rows, [0.0] * len(times), times)
     median_time = sorted(times)[len(times) // 2]
+    primary = PRIMARY_TERM[spec.operator]
     kept: list[str] = []
     for index, name in enumerate(names):
         column = [row[index] for row in rows]
         peak = max(abs(value) for value in column) or 1.0
+        # 主项的列范数比截距大很多个数量级，系数本身会很小。
+        # 用 coef×峰值 和 1e-5×中位时间比较时，主项会被当成 0 丢掉，
+        # 阶段时间只剩常数，更长的负载上整网会偏低好几倍。
+        if name == primary and theta[index] > 0.0:
+            kept.append(name)
+            continue
         if theta[index] * peak >= 1e-5 * median_time:
             kept.append(name)
     if len(kept) < len(names):

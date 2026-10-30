@@ -146,6 +146,9 @@ def fit_relative_linear(
         raise ValueError("没有样本")
     p = len(rows[0])
     theta = [0.0] * p
+    # 权重下限按测量时间的中位数，避免一条极短样本把 1/时间 放大到 1e6，
+    # 大列的范数被这一条撑爆，解出来的系数小到像 0。
+    floor = sorted(measured)[n // 2] * 1e-3
     for step in range(n_iter):
         if step == 0:
             preds = measured
@@ -154,7 +157,7 @@ def fit_relative_linear(
         weighted_rows = []
         weighted_y = []
         for i in range(n):
-            weight = 1.0 / max(preds[i], 1e-30)
+            weight = 1.0 / max(preds[i], floor, 1e-30)
             weighted_rows.append([weight * rows[i][j] for j in range(p)])
             weighted_y.append(weight * (measured[i] - base[i]))
         theta = nnls(weighted_rows, weighted_y)
