@@ -2,7 +2,8 @@
 
 复杂度实验只用未切分的运行。一次只动一个轴，从固定的单项里做相对误差的
 非负最小二乘。多出来的一项必须把误差明显降下来才保留。误差打平时留下标称
-算子的主项，避免和 batch 成比例的 lookup 把 L² 或转置换掉。
+算子的主项，避免和 batch 成比例的 lookup 把 L² 或转置换掉。自注意力上，
+SDPA 的一次项和投影都正比于 L 时留下一次项。
 
 切分实验一次只拟合一种切分。κ 和 v 在样本里成比例时标成没有分开，
 仍给出一组能对上时间的数，但不把它们当成各自的物理量。
@@ -214,10 +215,10 @@ def fit_complexity(spec: StageSpec, observations: list[StageObservation]) -> Com
     else:
         tolerance = best_mape + max(0.05 * best_mape, 1e-4)
         pool = [item for item in fitted if item[1] <= tolerance]
-    coefficients, mape = min(pool, key=lambda item: (len(item[0]), item[1], tuple(item[0])))
+    coefficients, mape = min(pool, key=lambda item: _model_rank(spec, item))
     rows = [[features(spec, load)[name] for name in coefficients] for load in loads] if coefficients else []
     identified = bool(coefficients) and column_rank(rows) == len(coefficients)
-    matches = PRIMARY_TERM[spec.operator] in coefficients
+    matches = _matches_operator(spec, coefficients)
     length_checked, depends = _length_effect(observations)
     slope = _width_slope(observations)
     if not coefficients:
@@ -437,6 +438,20 @@ def _split_from_report(spec: StageSpec, fit: SplitReport) -> StageSplit:
 def _push(loads: list[StageLoad], load: StageLoad) -> None:
     if load not in loads:
         loads.append(load)
+
+
+def _matches_operator(spec: StageSpec, coefficients: dict[str, float]) -> bool:
+    if spec.operator == "self_attn":
+        return "self_attn" in coefficients or "attn_linear" in coefficients
+    return PRIMARY_TERM[spec.operator] in coefficients
+
+
+def _model_rank(spec: StageSpec, item: tuple[dict[str, float], float]) -> tuple:
+    coefficients, mape = item
+    # 只扫长度时，投影 N_tok·d·d_hid 和 SDPA 一次项都正比于 L。
+    # 误差一样时留下注意力的一次项，不把核函数时间记成投影。
+    sdpa = 0 if spec.operator == "self_attn" and "attn_linear" in coefficients else 1
+    return (len(coefficients), mape, sdpa, tuple(coefficients))
 
 
 def _varies(column: list[float]) -> bool:

@@ -45,6 +45,11 @@ def main() -> None:
         hstu_stages()[2],
         {"self_attn": 2e-9, "intercept": 0.02},
     )
+    _show_complexity(
+        "自注意力 SDPA（一次项为主，长序列带一点平方项）",
+        hstu_stages()[2],
+        {"attn_linear": (7.0 / 3.0) * 2e-9 * 4096, "self_attn": 2e-9, "intercept": 0.02},
+    )
     mixer = token_mixer_stage(False)
     _show_complexity("token 轴矩阵乘", mixer, {"token_square": 1e-6})
     _show_complexity(
