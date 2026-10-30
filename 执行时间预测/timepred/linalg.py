@@ -138,16 +138,24 @@ def fit_relative_linear(
 ) -> list[float]:
     """拟合 measured ≈ base + Xθ，θ ≥ 0，目标接近 log 时间上的平方误差。
 
-    权重取当前预测时间的倒数，使长序列和短序列按相对误差进入损失。
+    列尺度和样本权重分开。每一列先除以自己的峰值，平方项和截距都进到
+    一量级，再按当前预测时间的倒数做相对误差。峰值来自原始特征，
+    不随 1/预测变化，也不靠极短样本的权重下限去压列范数。
+    大 L 的 1/预测很小，但平方项在方程组里的元素是特征/预测：预测跟着
+    特征涨时，它趋近常数，不会把系数压成 0。
     无噪声且模型正确时，第一轮就能得到残差为零的参数。
     """
     n = len(rows)
     if n == 0:
         raise ValueError("没有样本")
     p = len(rows[0])
+    scales = []
+    for j in range(p):
+        scales.append(max(abs(rows[i][j]) for i in range(n)) or 1.0)
+    scaled_rows = [[rows[i][j] / scales[j] for j in range(p)] for i in range(n)]
     theta = [0.0] * p
-    # 权重下限按测量时间的中位数，避免一条极短样本把 1/时间 放大到 1e6，
-    # 大列的范数被这一条撑爆，解出来的系数小到像 0。
+    # 权重下限只挡住一条极短样本把 1/时间放到 1e6。列与列差几个数量级
+    # 由上面的峰值缩放处理。
     floor = sorted(measured)[n // 2] * 1e-3
     for step in range(n_iter):
         if step == 0:
@@ -158,7 +166,8 @@ def fit_relative_linear(
         weighted_y = []
         for i in range(n):
             weight = 1.0 / max(preds[i], floor, 1e-30)
-            weighted_rows.append([weight * rows[i][j] for j in range(p)])
+            weighted_rows.append([weight * scaled_rows[i][j] for j in range(p)])
             weighted_y.append(weight * (measured[i] - base[i]))
-        theta = nnls(weighted_rows, weighted_y)
+        beta = nnls(weighted_rows, weighted_y)
+        theta = [beta[j] / scales[j] for j in range(p)]
     return theta

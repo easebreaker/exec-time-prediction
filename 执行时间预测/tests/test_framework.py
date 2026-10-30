@@ -13,7 +13,7 @@ from timepred.fit import fit
 from timepred.formula import compute_speedup, linear_cut, slide_time
 from timepred.holdout import holdout_by_load
 from timepred.io import load_samples, write_template
-from timepred.linalg import nnls
+from timepred.linalg import fit_relative_linear, nnls
 from timepred.memory import memory_parts
 from timepred.predict import SchemeParams, TimeModel
 from timepred.schema import (
@@ -68,6 +68,30 @@ class FormulaTests(unittest.TestCase):
         self.assertAlmostEqual(coef[0], 2.0, places=6)
         self.assertAlmostEqual(coef[1], 0.0, places=6)
         self.assertAlmostEqual(coef[2], 3.0, places=6)
+
+    def test_long_rows_keep_the_square_coefficient_when_their_weight_is_small(self) -> None:
+        coefficient = 2e-9
+        intercept = 0.02
+        rows: list[list[float]] = []
+        measured: list[float] = []
+        for length in (128, 256, 512):
+            for batch in (1, 2, 4, 8):
+                feature = float(batch * 4 * length * length * 16)
+                for _repeat in range(4):
+                    rows.append([feature, 1.0])
+                    measured.append(coefficient * feature + intercept)
+        for length in (8192, 16384):
+            feature = float(4 * 4 * length * length * 16)
+            rows.append([feature, 1.0])
+            measured.append(coefficient * feature + intercept)
+        weights = [1.0 / time for time in measured]
+        long_share = sum(weights[-2:]) / sum(weights)
+        self.assertLess(long_share, 0.01)
+        theta = fit_relative_linear(rows, [0.0] * len(rows), measured)
+        assert_rel(self, theta[0], coefficient)
+        assert_rel(self, theta[1], intercept)
+        peak = float(8 * 8 * (32768 ** 2) * 64)
+        assert_rel(self, theta[0] * peak + theta[1], coefficient * peak + intercept)
 
     def test_linear_cut_matches_speedup(self) -> None:
         t0 = 3.45
