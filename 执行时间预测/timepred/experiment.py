@@ -29,6 +29,7 @@ from .stage import (
     compute_parts,
     default_load,
     features,
+    primary_term,
     scaling_power,
     volume_bytes,
 )
@@ -207,7 +208,7 @@ def fit_complexity(spec: StageSpec, observations: list[StageObservation]) -> Com
         raise FrameworkError(f"{spec.name} 的复杂度没有可用的拟合")
     # 误差打平时保留标称主项。与 batch 成比例时，按名字会先选到
     # cross_attn、lookup，长序列上的 L² 或 boost 的转置就被换成常数。
-    primary = PRIMARY_TERM[spec.operator]
+    primary = primary_term(spec)
     best_mape = min(mape for _, mape in fitted)
     declared = [item for item in fitted if primary in item[0] and item[1] <= best_mape + 1e-4]
     if declared:
@@ -497,7 +498,7 @@ def _fit_terms(
         return {}, math.inf
     theta = fit_relative_linear(rows, [0.0] * len(times), times)
     median_time = sorted(times)[len(times) // 2]
-    primary = PRIMARY_TERM[spec.operator]
+    primary = primary_term(spec)
     kept: list[str] = []
     for index, name in enumerate(names):
         column = [row[index] for row in rows]

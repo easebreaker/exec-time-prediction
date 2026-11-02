@@ -9,9 +9,9 @@
 - lookup 查表：B · n_id
 - linear 线性投影：N_tok · d · d_hid。N_tok 由 token_axis 决定。
 - self_attn 自注意力：B · n_head · L² · d_head。L 是该批的填充长度。
-  SDPA 的实测更接近 L 的 1 到 1.3 次，所以另有一次项
-  attn_linear = B · n_head · L · d_head。两项同时在时，有效次数落在 1 和 2 之间。
-  切分仍只缩小平方项。只切 Query、KV 留整段时，一次项还要读整段 KV，不除以并行度。
+  sdpa=True 时改用融合内核：平方项返回 0，只留一次项
+  attn_linear = B · n_head · L · d_head。默认 sdpa=False，一次项返回 0。
+  切分仍只缩小平方项。SDPA 的一次项还要读整段 KV，不除以并行度。
 - cross_attn 交叉注意力：B · N_q · L_kv · d
 - group_attn 组内注意力：B · R · T² · d。groups_follow_length 时 R = L / T。
 - token_gemm token 轴矩阵乘：与组内注意力同一单项。R 固定时不读 L。
@@ -133,6 +133,13 @@ def scaling_power(pattern: str, term: str) -> int:
     return SCALING_POWER.get(pattern, {}).get(term, 0)
 
 
+def primary_term(spec: "StageSpec") -> str:
+    """这一阶段在拟合里要保住的单项。SDPA 的主项是一次项，不是 L²。"""
+    if spec.sdpa:
+        return "attn_linear"
+    return PRIMARY_TERM[spec.operator]
+
+
 @dataclass(frozen=True)
 class StageLoad:
     """一次阶段实验的负载。标准轴不够时放进 extras。
@@ -191,11 +198,14 @@ class StageSpec:
     elem_bytes: int = 2
     token_axis: str = "real"
     groups_follow_length: bool = False
+    sdpa: bool = False
     axes: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.operator not in OPERATORS:
             raise FrameworkError(f"未知的算子 {self.operator}")
+        if self.sdpa and self.operator != "self_attn":
+            raise FrameworkError(f"{self.name} 不是自注意力，不能开 SDPA")
         if self.token_axis not in TOKEN_AXES:
             raise FrameworkError(f"{self.name} 的 token 轴未知")
         if self.n_layers < 1 or self.elem_bytes < 1:
@@ -269,22 +279,16 @@ def features(spec: StageSpec, load: StageLoad) -> dict[str, float]:
     groups = groups_of(spec, load)
     tokens = axis(spec, load, "tokens", "tokens")
     length = axis(spec, load, "length", "length")
+    heads = axis(spec, load, "n_head", "n_head")
+    d_head = axis(spec, load, "d_head", "d_head")
+    # 同一次拟合只走一种注意力实现。另一种公式返回 0，列不变，不会被选进模型。
+    square = 0.0 if spec.sdpa else batch * heads * length * length * d_head
+    sdpa_term = batch * heads * length * d_head if spec.sdpa else 0.0
     return {
         "lookup": batch * axis(spec, load, "n_id", "n_id"),
         "linear": linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden"),
-        "self_attn": (
-            batch
-            * axis(spec, load, "n_head", "n_head")
-            * length
-            * length
-            * axis(spec, load, "d_head", "d_head")
-        ),
-        "attn_linear": (
-            batch
-            * axis(spec, load, "n_head", "n_head")
-            * length
-            * axis(spec, load, "d_head", "d_head")
-        ),
+        "self_attn": square,
+        "attn_linear": sdpa_term,
         "cross_attn": (
             batch
             * axis(spec, load, "n_query", "n_query")

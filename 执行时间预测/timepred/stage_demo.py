@@ -14,7 +14,7 @@ from .experiment import (
     stage_time,
 )
 from .recipes import hstu_stages, token_mixer_stage
-from .stage import StageSplit, default_load, volume_bytes
+from .stage import StageSpec, StageSplit, default_load, volume_bytes
 
 
 def _measure(spec, coefficients, loads, split, **kwargs) -> list[StageObservation]:
@@ -46,9 +46,9 @@ def main() -> None:
         {"self_attn": 2e-9, "intercept": 0.02},
     )
     _show_complexity(
-        "自注意力 SDPA（一次项为主，长序列带一点平方项）",
-        hstu_stages()[2],
-        {"attn_linear": (7.0 / 3.0) * 2e-9 * 4096, "self_attn": 2e-9, "intercept": 0.02},
+        "自注意力 SDPA",
+        StageSpec("attn", "self_attn", sdpa=True),
+        {"attn_linear": 2e-6, "intercept": 0.02},
     )
     mixer = token_mixer_stage(False)
     _show_complexity("token 轴矩阵乘", mixer, {"token_square": 1e-6})

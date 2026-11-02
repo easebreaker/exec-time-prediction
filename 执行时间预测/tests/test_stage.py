@@ -54,7 +54,11 @@ class FeatureTests(unittest.TestCase):
         jagged = dense.varied(n_real=50)
         self.assertEqual(features(attn, dense)["self_attn"], features(attn, jagged)["self_attn"])
         self.assertEqual(features(attn, dense)["self_attn"], 2 * 2 * 100 * 100 * 4)
-        self.assertEqual(features(attn, dense)["attn_linear"], 2 * 2 * 100 * 4)
+        self.assertEqual(features(attn, dense)["attn_linear"], 0.0)
+        sdpa = StageSpec("attn", "self_attn", sdpa=True)
+        self.assertEqual(features(sdpa, dense)["self_attn"], 0.0)
+        self.assertEqual(features(sdpa, dense)["attn_linear"], 2 * 2 * 100 * 4)
+        self.assertEqual(features(sdpa, jagged)["attn_linear"], features(sdpa, dense)["attn_linear"])
         self.assertEqual(features(proj, dense)["linear"], 200 * 8 * 8)
         self.assertEqual(features(proj, jagged)["linear"], 50 * 8 * 8)
 
@@ -89,15 +93,13 @@ class ComplexityTests(unittest.TestCase):
         self.assertLess(report.mape, 1e-4)
 
     def test_sdpa_keeps_the_linear_length_term(self) -> None:
-        spec = StageSpec("attn", "self_attn")
+        spec = StageSpec("attn", "self_attn", sdpa=True)
         coefficient = 2e-6
         coefficients = {"attn_linear": coefficient, "intercept": 0.01}
         report = fit_complexity(spec, measure(spec, coefficients, complexity_grid(spec), StageSplit("none")))
         self.assertTrue(report.matches_operator)
         self.assertTrue(report.depends_on_length)
-        self.assertIn("attn_linear", report.coefficients())
-        self.assertNotIn("self_attn", report.coefficients())
-        self.assertNotIn("linear", report.coefficients())
+        self.assertEqual(set(report.coefficients()), {"attn_linear", "intercept"})
         assert_rel(self, report.coefficients()["attn_linear"], coefficient)
         longer = default_load().varied(length=8192, n_head=8)
         truth, _, _ = stage_time(spec, coefficients, longer, StageSplit("none"))
@@ -106,28 +108,15 @@ class ComplexityTests(unittest.TestCase):
         length_only = [default_load().varied(length=length) for length in (128, 256, 512, 1024, 2048, 4096)]
         length_report = fit_complexity(spec, measure(spec, {"attn_linear": coefficient}, length_only, StageSplit("none")))
         self.assertEqual(set(length_report.coefficients()), {"attn_linear"})
+        batches = [default_load().varied(batch=batch) for batch in (1, 2, 4, 8)]
+        batch_report = fit_complexity(spec, measure(spec, coefficients, batches, StageSplit("none")))
+        self.assertIn("attn_linear", batch_report.coefficients())
+        self.assertNotIn("lookup", batch_report.coefficients())
+        self.assertNotIn("linear", batch_report.coefficients())
 
-    def test_sdpa_between_linear_and_square_keeps_both_terms(self) -> None:
-        spec = StageSpec("attn", "self_attn")
-        # L=4096 处对数斜率约 1.3，更短的序列更接近 1。
-        square = 2e-9
-        linear = (7.0 / 3.0) * square * 4096
-        coefficients = {"self_attn": square, "attn_linear": linear}
-        report = fit_complexity(spec, measure(spec, coefficients, complexity_grid(spec), StageSplit("none")))
-        self.assertTrue(report.matches_operator)
-        self.assertIn("self_attn", report.coefficients())
-        self.assertIn("attn_linear", report.coefficients())
-        assert_rel(self, report.coefficients()["self_attn"], square)
-        assert_rel(self, report.coefficients()["attn_linear"], linear)
-        short = default_load().varied(length=256)
-        long = default_load().varied(length=4096)
-        short_time, _, _ = stage_time(spec, coefficients, short, StageSplit("none"))
-        long_time, _, _ = stage_time(spec, coefficients, long, StageSplit("none"))
-        slope = math.log(long_time / short_time) / math.log(4096 / 256)
-        self.assertGreater(slope, 1.0)
-        self.assertLess(slope, 1.35)
-        predicted, _, _ = stage_time(spec, report.coefficients(), long, StageSplit("none"))
-        assert_rel(self, predicted, long_time)
+    def test_sdpa_is_only_for_self_attention(self) -> None:
+        with self.assertRaises(FrameworkError):
+            StageSpec("proj", "linear", sdpa=True)
 
     def test_token_gemm_does_not_depend_on_sequence_length(self) -> None:
         spec = StageSpec("mixer", "token_gemm")
