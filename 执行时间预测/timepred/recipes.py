@@ -52,8 +52,9 @@ def longer_stages() -> tuple[StageSpec, ...]:
 def hyformer_stages(encoder: str = "longer") -> tuple[StageSpec, ...]:
     """Query Decoding 是交叉注意力，Query Boosting 是转置混合加逐 token 投影。
 
-    encoder 为 longer 时，序列侧先做短 query 对长 KV 的交叉注意力。
-    短序列长度放在 extras['short_len']，解码 query 数放在 extras['decode_queries']。
+    decode 的 query 数和 KV 长度都是 short_len，不读用户序列 length。
+    序列侧交叉注意力的 query 数也是 short_len，KV 长度是 extras['kv_len']。
+    kv_len 与 length、short_len 都不是同一列，三条轴可以分开扫。
     Boosting 的 token 数放在 extras['boost_tokens']，不读用户序列长度。
     """
     if encoder not in ("longer", "full", "swiglu"):
@@ -67,7 +68,7 @@ def hyformer_stages(encoder: str = "longer") -> tuple[StageSpec, ...]:
             StageSpec(
                 "seq_cross",
                 "cross_attn",
-                axes={"n_query": "short_len", "length_kv": "length"},
+                axes={"n_query": "short_len", "length_kv": "kv_len"},
             )
         )
         stages.append(StageSpec("seq_ffn", "linear", token_axis="query", axes={"n_query": "short_len"}))
@@ -78,7 +79,7 @@ def hyformer_stages(encoder: str = "longer") -> tuple[StageSpec, ...]:
             StageSpec(
                 "decode",
                 "cross_attn",
-                axes={"n_query": "decode_queries", "length_kv": "short_len"},
+                axes={"n_query": "short_len", "length_kv": "short_len"},
             ),
             StageSpec("boost_mix", "token_permute", axes={"tokens": "boost_tokens"}),
             StageSpec(

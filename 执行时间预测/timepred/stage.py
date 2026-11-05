@@ -12,7 +12,10 @@
   sdpa=True 时改用融合内核：平方项返回 0，只留一次项
   attn_linear = B · n_head · L · d_head。默认 sdpa=False，一次项返回 0。
   切分仍只缩小平方项。SDPA 的一次项还要读整段 KV，不除以并行度。
-- cross_attn 交叉注意力：B · N_q · L_kv · d
+- cross_attn 交叉注意力：B · N_q · L_kv · d。L_kv 是独立参数，读 length_kv，
+  或用 axes 接到 short_len、kv_len 等字段。不读用户序列 length。
+  HyFormer 的 decode 上，query 数和 KV 长度都是 short_len。
+  序列侧交叉注意力的 KV 接到 kv_len，与 short_len、length 分开。
 - group_attn 组内注意力：B · R · T² · d。groups_follow_length 时 R = L / T。
 - token_gemm token 轴矩阵乘：与组内注意力同一单项。R 固定时不读 L。
 - token_permute 转置混合：B · T · d，按字节计，没有 T²。
@@ -216,6 +219,10 @@ class StageSpec:
         for role, field in self.axes.items():
             if not role or not field:
                 raise FrameworkError(f"{self.name} 的轴绑定不完整")
+        if self.operator == "cross_attn" and self.axes.get("length_kv") == "length":
+            raise FrameworkError(
+                f"{self.name} 的 KV 长度不要接到用户序列 length 上，用 length_kv 或单独的轴"
+            )
 
 
 @dataclass(frozen=True)
@@ -289,6 +296,7 @@ def features(spec: StageSpec, load: StageLoad) -> dict[str, float]:
         "linear": linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden"),
         "self_attn": square,
         "attn_linear": sdpa_term,
+        # L_kv 与用户序列 length 是两列。接到 length 上会在改序列长度时把 KV 一起带走。
         "cross_attn": (
             batch
             * axis(spec, load, "n_query", "n_query")

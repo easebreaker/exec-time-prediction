@@ -18,6 +18,17 @@ from timepred.experiment import (
     stage_time,
 )
 from timepred.linalg import column_rank
+from timepred.plan import (
+    BATCHES,
+    BATCH_LENGTHS,
+    CP_DEGREES,
+    CP_LENGTHS,
+    FIT_LENGTHS,
+    all_requests,
+    hstu_requests,
+    longer_requests,
+    mtgr_requests,
+)
 from timepred.recipes import hyformer_stages, hstu_stages, longer_stages, rankmixer_stages
 from timepred.schema import FrameworkError
 from timepred.stage import (
@@ -216,7 +227,7 @@ class ComplexityTests(unittest.TestCase):
         coefficients = {"self_attn": coefficient, "intercept": intercept}
         report = fit_complexity(spec, measure(spec, coefficients, loads, StageSplit("none")))
         self.assertIn("self_attn", report.coefficients())
-        heavy = default_load().varied(batch=128, length=65536, n_head=64, d_head=128, width=512, hidden=2048)
+        heavy = default_load().varied(batch=128, length=262144, n_head=64, d_head=128, width=512, hidden=2048)
         truth, _, _ = stage_time(spec, coefficients, heavy, StageSplit("none"))
         predicted, _, _ = stage_time(spec, report.coefficients(), heavy, StageSplit("none"))
         self.assertGreater(truth / intercept, 4.0)
@@ -471,14 +482,28 @@ class NetworkTests(unittest.TestCase):
 
     def test_hyformer_decode_and_sequence_cross_read_different_lengths(self) -> None:
         stages = {spec.name: spec for spec in hyformer_stages("longer")}
-        load = default_load().varied(extras={"short_len": 8, "decode_queries": 3, "boost_tokens": 16})
+        load = default_load().varied(
+            length=512,
+            length_kv=100,
+            extras={"short_len": 8, "kv_len": 20, "boost_tokens": 16},
+        )
         sequence = features(stages["seq_cross"], load)["cross_attn"]
         decode = features(stages["decode"], load)["cross_attn"]
-        self.assertNotEqual(sequence, decode)
-        self.assertEqual(sequence, load.batch * 8 * load.length * load.width)
-        self.assertEqual(decode, load.batch * 3 * 8 * load.width)
+        # seq_cross：Q=short_len，KV=kv_len。decode：Q 和 KV 都是 short_len。
+        self.assertEqual(sequence, load.batch * 8 * 20 * load.width)
+        self.assertEqual(decode, load.batch * 8 * 8 * load.width)
+        longer = load.varied(length=4096, length_kv=400)
+        self.assertEqual(features(stages["seq_cross"], longer)["cross_attn"], sequence)
+        self.assertEqual(features(stages["decode"], longer)["cross_attn"], decode)
+        moved_kv = load.varied(extras={"kv_len": 40})
+        self.assertEqual(features(stages["seq_cross"], moved_kv)["cross_attn"], load.batch * 8 * 40 * load.width)
+        self.assertEqual(features(stages["decode"], moved_kv)["cross_attn"], decode)
         self.assertTrue(longer_stages()[1].groups_follow_length)
         self.assertEqual(rankmixer_stages()[0].operator, "token_permute")
+
+    def test_cross_attention_kv_length_is_not_the_user_length(self) -> None:
+        with self.assertRaises(FrameworkError):
+            StageSpec("seq_cross", "cross_attn", axes={"n_query": "short_len", "length_kv": "length"})
 
     def test_csv_roundtrip(self) -> None:
         spec = StageSpec("attn", "self_attn", axes={"length": "short_len"})
@@ -512,6 +537,51 @@ class NetworkTests(unittest.TestCase):
             loaded = load_stage_samples(path)
         self.assertEqual(loaded[0].load.extras["short_len"], 32)
         self.assertEqual(loaded[0].split.kind, "none")
+
+
+class MeasurementPlanTests(unittest.TestCase):
+    def test_hstu_and_longer_cover_batch_and_long_sequences(self) -> None:
+        for requests in (hstu_requests(), longer_requests()):
+            fit = [item for item in requests if item.role == "拟合" and item.series == "长度"]
+            self.assertEqual({item.length for item in fit}, set(FIT_LENGTHS))
+            batches = [item for item in requests if item.series == "batch"]
+            self.assertEqual({item.batch for item in batches}, set(BATCHES))
+            self.assertEqual({item.length for item in batches}, set(BATCH_LENGTHS))
+            self.assertTrue(any(item.role == "留出" and item.length == 16384 for item in requests))
+
+    def test_mtgr_cp_crosses_degree_with_length(self) -> None:
+        splits = [item for item in mtgr_requests() if item.series == "切分"]
+        self.assertEqual({(item.degree, item.length) for item in splits}, {(n, length) for n in CP_DEGREES for length in CP_LENGTHS})
+        unsplit = {(item.length, item.batch) for item in mtgr_requests() if item.split == "none" and item.series == "长度"}
+        for item in splits:
+            self.assertIn((item.length, item.batch), unsplit)
+        self.assertEqual(len({item.id for item in all_requests()}), len(all_requests()))
+
+    def test_planned_cp_grid_separates_kappa_and_bandwidth(self) -> None:
+        spec = StageSpec("attn", "self_attn")
+        coefficients = {"self_attn": 2e-9, "intercept": 0.02}
+        complexity = fit_complexity(spec, measure(spec, coefficients, complexity_grid(spec), StageSplit("none")))
+        loads = [default_load().varied(length=length, batch=1) for length in CP_LENGTHS]
+        observations = []
+        for degree in CP_DEGREES:
+            observations.extend(
+                measure(
+                    spec,
+                    coefficients,
+                    loads,
+                    StageSplit("cp_q", degree),
+                    kappa=0.25,
+                    tau_s=0.01,
+                    v_s_per_byte=1e-6,
+                )
+            )
+        report = fit_split(spec, complexity, observations)
+        self.assertTrue(report.identified)
+        self.assertNotIn("kappa", report.inactive)
+        self.assertNotIn("v", report.inactive)
+        assert_rel(self, report.kappa, 0.25)
+        assert_rel(self, report.tau_s, 0.01)
+        assert_rel(self, report.v_s_per_byte, 1e-6)
 
 
 if __name__ == "__main__":

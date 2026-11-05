@@ -133,12 +133,14 @@ def stage_time(
     return total, compute, comm
 
 
+# 64 和 8192 补进长度轴。HSTU、LONGER 只扫到 4096 时，长序列的次数站不稳。
+_LENGTHS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
 _BOUND_GRIDS = {
-    "length": (128, 256, 512, 1024, 2048, 4096),
+    "length": _LENGTHS,
     "tokens": (4, 8, 16, 32),
     "groups": (1, 2, 4, 8),
     "n_query": (1, 2, 4, 8, 16),
-    "length_kv": (128, 512, 2048),
+    "length_kv": _LENGTHS,
     "n_id": (16, 64, 256, 1024),
     "n_head": (1, 2, 4, 8),
     "width": (32, 64, 128, 256),
@@ -155,7 +157,7 @@ def complexity_grid(spec: StageSpec, base: StageLoad | None = None) -> list[Stag
     loads = [base]
     for batch in (1, 2, 4, 8):
         _push(loads, base.varied(batch=batch))
-    for length in (128, 256, 512, 1024, 2048, 4096):
+    for length in _LENGTHS:
         _push(loads, base.varied(length=length))
     for tokens in (4, 8, 16, 32):
         _push(loads, base.varied(tokens=tokens))
@@ -164,7 +166,7 @@ def complexity_grid(spec: StageSpec, base: StageLoad | None = None) -> list[Stag
             _push(loads, base.varied(groups=groups))
     for n_query in (1, 2, 4, 8, 16):
         _push(loads, base.varied(n_query=n_query))
-    for length_kv in (128, 512, 2048):
+    for length_kv in _LENGTHS:
         _push(loads, base.varied(length_kv=length_kv))
     for n_id in (16, 64, 256, 1024):
         _push(loads, base.varied(n_id=n_id))
