@@ -172,8 +172,8 @@ class StageLoad:
         named = {field: getattr(self, field) for field in _LOAD_FIELDS}
         named.update(self.extras)
         for name, value in named.items():
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise FrameworkError(f"{name} 至少为 1")
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise FrameworkError(f"{name} 至少为 0")
 
     def varied(self, **kwargs: int | Mapping[str, int]) -> "StageLoad":
         extras = dict(self.extras)
@@ -291,21 +291,24 @@ def features(spec: StageSpec, load: StageLoad) -> dict[str, float]:
     # 同一次拟合只走一种注意力实现。另一种公式返回 0，列不变，不会被选进模型。
     square = 0.0 if spec.sdpa else batch * heads * length * length * d_head
     sdpa_term = batch * heads * length * d_head if spec.sdpa else 0.0
+
+    # 按算子只算相关特征，不相关的返回 0。
+    op = spec.operator
     return {
-        "lookup": batch * axis(spec, load, "n_id", "n_id"),
-        "linear": linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden"),
-        "self_attn": square,
-        "attn_linear": sdpa_term,
+        "lookup": batch * axis(spec, load, "n_id", "n_id") if op == "lookup" else 0.0,
+        "linear": linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden") if op == "linear" else 0.0,
+        "self_attn": square if op == "self_attn" else 0.0,
+        "attn_linear": sdpa_term if op == "self_attn" else 0.0,
         # L_kv 与用户序列 length 是两列。接到 length 上会在改序列长度时把 KV 一起带走。
         "cross_attn": (
             batch
             * axis(spec, load, "n_query", "n_query")
             * axis(spec, load, "length_kv", "length_kv")
             * width
-        ),
-        "token_square": batch * groups * tokens * tokens * width,
-        "token_linear": batch * groups * tokens * width,
-        "permute": batch * tokens * width,
+        ) if op == "cross_attn" else 0.0,
+        "token_square": batch * groups * tokens * tokens * width if op in ("group_attn", "token_gemm") else 0.0,
+        "token_linear": batch * groups * tokens * width if op in ("group_attn", "token_gemm") else 0.0,
+        "permute": batch * tokens * width if op == "token_permute" else 0.0,
         "intercept": 1.0,
     }
 
