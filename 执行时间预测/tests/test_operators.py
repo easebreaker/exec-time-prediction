@@ -197,6 +197,18 @@ class TileModelTests(unittest.TestCase):
         with self.assertRaises(FrameworkError):
             StageSpec("attn", "self_attn", model="tile")
 
+    def test_tile_scales_with_the_split_degree(self) -> None:
+        # cp_q 除 N、cp_qk 除 N²；未切分时不动。块数在大 L 上趋近 L²/N 与 L²/N²。
+        spec = StageSpec("attn", "self_attn", model="tile", block_m=128, block_n=128)
+        load = StageLoad(batch=1, length=4096, n_head=8, d_head=16)
+        coefficients = {"tile": 7e-6, "intercept": 9e-3}
+        plain, _, _ = stage_time(spec, coefficients, load, StageSplit("none"))
+        shallow, _, _ = stage_time(spec, coefficients, load, StageSplit("cp_q", 4))
+        deep, _, _ = stage_time(spec, coefficients, load, StageSplit("cp_qk", 4))
+        block = features(spec, load)["tile"] * 7e-6
+        self.assertAlmostEqual(plain - shallow, block - block / 4, places=9)
+        self.assertAlmostEqual(plain - deep, block - block / 16, places=9)
+
     def test_sparse_multiplies_the_square_term(self) -> None:
         dense = StageSpec("attn", "self_attn")
         causal = StageSpec("attn", "self_attn", sparse=0.5)

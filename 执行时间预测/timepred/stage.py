@@ -127,9 +127,10 @@ LEGAL_SPLITS = {
     "score_gemm": ("none",),
 }
 # 正数表示这一项的单卡时间除以 N ** power，再乘 (1 + κ (N - 1))。
+# tile 列与 self_attn 同幂：块数 ceils 后在大 L 上趋近 L²/N（cp_q）与 L²/N²（cp_qk）。
 SCALING_POWER = {
-    "cp_q": {"self_attn": 1},
-    "cp_qk": {"self_attn": 2},
+    "cp_q": {"self_attn": 1, "tile": 1},
+    "cp_qk": {"self_attn": 2, "tile": 2},
     "shard_kv": {"cross_attn": 1},
     "shard_q": {"cross_attn": 1},
     "tp": {"linear": 1, "token_linear": 1},
@@ -393,10 +394,14 @@ def linear_tokens(spec: StageSpec, load: StageLoad) -> float:
 
 
 def tile_count(spec: StageSpec, load: StageLoad) -> float:
-    """按基本块数计的张量块数（含头与 batch）。
+    """按基本块数计的张量块数（含头与 batch），**未切开前**的整块数。
 
     self_attn 的 Query 侧被并行度切开，KV 侧留整段；cross_attn 的 Query 侧
     是 N_q、KV 侧是 L_kv。块数对 L 是台阶函数，不是幂。
+
+    切分由 SCALING_POWER 的 "tile" 一项负责：cp_q 除 N、cp_qk 除 N²。
+    二者在大 L 上分别等于 ceil(L/N/BM)·ceil(L/BM) 与 ceil(L/N/BM)²，
+    小 L 上台阶会被除平，是这一写法的已知近似。
     """
     if spec.block_m < 1 or spec.block_n < 1:
         return 0.0
