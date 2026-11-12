@@ -1,3 +1,10 @@
 /*
 !/.gitignore
 !/执行时间预测/
+
+# 第三方只读克隆，不进仓库（7 MB，Apache-2.0）。重建方法见 hstu_probe.py 头部注释。
+# 先放行目录本身（否则 /* 会把 _vendor/ 整个忽略，里面的规则都不生效），
+# 再忽略其内容，最后单独放行我们自己的核对脚本。
+!/_vendor/
+/_vendor/*
+!/_vendor/hstu_probe.py
