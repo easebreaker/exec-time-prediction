@@ -45,6 +45,10 @@ class MeasureRequest:
     split: str
     degree: int
     note: str
+    # 补登记的轴。旧四模型不用，MoE 与召回的请求才填。
+    n_exp: int | None = None
+    topk: int | None = None
+    n_item: int | None = None
 
 
 def _row(
@@ -64,6 +68,9 @@ def _row(
     split: str = "none",
     degree: int = 1,
     note: str,
+    n_exp: int | None = None,
+    topk: int | None = None,
+    n_item: int | None = None,
 ) -> MeasureRequest:
     n_real = batch * length
     return MeasureRequest(
@@ -74,7 +81,9 @@ def _row(
         batch=batch,
         length=length,
         n_real=n_real,
-        n_id=n_real if n_id is None else n_id,
+        # n_id 是每样本的查表次数：stage.py 的 lookup 主项是 B·n_id，
+        # 再乘 batch 会把 total 重复算一次。样本等长且无填充时即 length。
+        n_id=(n_real // batch) if n_id is None else n_id,
         tokens=tokens,
         groups=4 if groups is None else groups,
         n_query=8,
@@ -85,12 +94,15 @@ def _row(
         split=split,
         degree=degree,
         note=note,
+        n_exp=n_exp,
+        topk=topk,
+        n_item=n_item,
     )
 
 
 def _length_and_batch(model: str, prefix: str, *, longer: bool) -> list[MeasureRequest]:
     rows: list[MeasureRequest] = []
-    length_note = "稠密。n_id 预填为 n_real，以实际查表次数为准。"
+    length_note = "稠密。n_id 预填为每样本次数（等于 length），以实际查表次数为准。"
     if longer:
         length_note += " R=⌊L/T⌋，T 与权重不符则整列替换并重算 R。"
     for length in FIT_LENGTHS:
@@ -272,3 +284,84 @@ def hyformer_requests() -> tuple[MeasureRequest, ...]:
 
 def all_requests() -> tuple[MeasureRequest, ...]:
     return mtgr_requests() + hstu_requests() + longer_requests() + hyformer_requests()
+
+
+# ---------------------------------------------------------------- 补登记的轴
+# 下面两类请求**不进 all_requests()**：它们要挂在含 MoE 或含召回的模型上，
+# 而现成的四个权重里没有这两段。原 88 条保持不变，这里只是把「该测什么」写出来。
+
+EXP_SWEEP = (32, 64, 128, 256)
+EP_DEGREES = (2, 4, 8)
+EP_SPANS = ("intra", "cross")
+ITEM_SWEEP = (128, 1024, 8192, 65536)
+
+
+def moe_requests(model: str = "MoE-参考", length: int = 512) -> tuple[MeasureRequest, ...]:
+    """门控与分发的测定计划。
+
+    门控：只改专家数，验证成本随 N_exp 线性、且 renorm=1 时打分只对 top-k 做。
+    分发：只改 EP 并行度与跨度，验证 V 随 topk·token 数变、v 分两档。
+    """
+    rows: list[MeasureRequest] = []
+    for n_exp in EXP_SWEEP:
+        rows.append(
+            _row(
+                model,
+                f"MO-G-N{n_exp:04d}",
+                "专家数",
+                "拟合",
+                length=length,
+                n_exp=n_exp,
+                topk=6,
+                note="门控。只改 N_exp，token 数不变。",
+            )
+        )
+    for degree in EP_DEGREES:
+        for span in EP_SPANS:
+            rows.append(
+                _row(
+                    model,
+                    f"MO-D-E{degree}-{span[0].upper()}",
+                    "专家并行",
+                    "拟合",
+                    length=length,
+                    n_exp=64,
+                    topk=6,
+                    split="ep",
+                    degree=degree,
+                    note=f"分发。EP={degree}，跨度={span}；每档各一组，用于分开两档 v。",
+                )
+            )
+    rows.append(
+        _row(
+            model,
+            "MO-D-E8-C-L2048",
+            "专家并行",
+            "拟合",
+            length=2048,
+            n_exp=64,
+            topk=6,
+            split="ep",
+            degree=8,
+            note="同一 EP、换长度：让 V 与 token 数分离，否则与 κ 共线。",
+        )
+    )
+    return tuple(rows)
+
+
+def retrieval_requests(model: str = "召回-参考", length: int = 64) -> tuple[MeasureRequest, ...]:
+    """全库打分：只改商品数，验证成本随 N_item 线性且与长度无关。"""
+    rows: list[MeasureRequest] = []
+    for n_item in ITEM_SWEEP:
+        rows.append(
+            _row(
+                model,
+                f"RT-S-I{n_item:06d}",
+                "商品数",
+                "拟合" if n_item < ITEM_SWEEP[-1] else "留出",
+                length=length,
+                n_item=n_item,
+                note="全库打分。用户长度固定，只改商品数。",
+            )
+        )
+    return tuple(rows)

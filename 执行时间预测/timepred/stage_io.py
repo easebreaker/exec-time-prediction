@@ -26,9 +26,15 @@ _COLUMNS = (
     "hidden",
     "n_head",
     "d_head",
+    "n_exp",
+    "topk",
+    "n_user",
+    "n_item",
+    "n_probe",
     "split",
     "degree",
     "micro",
+    "span",
     "time_s",
     "comm_bytes",
     "comm_time_s",
@@ -112,17 +118,24 @@ def _row(row: dict[str, str | None]) -> StageObservation:
         hidden=_required_int(_cell(row, "hidden"), "hidden"),
         n_head=_required_int(_cell(row, "n_head"), "n_head"),
         d_head=_required_int(_cell(row, "d_head"), "d_head"),
+        # 新登记的两条轴。旧表没有这几列时按默认值读。
+        n_exp=_optional_int(_cell(row, "n_exp"), "n_exp") or 64,
+        topk=_optional_int(_cell(row, "topk"), "topk") or 6,
+        n_user=_optional_int(_cell(row, "n_user"), "n_user") or 1,
+        n_item=_optional_int(_cell(row, "n_item"), "n_item") or 1000,
+        n_probe=_optional_int(_cell(row, "n_probe"), "n_probe") or 0,
         extras=extras,
     )
     kind = _cell(row, "split") or "none"
     degree = _optional_int(_cell(row, "degree"), "degree") or 1
     micro = _optional_int(_cell(row, "micro"), "micro") or 1
+    span = _cell(row, "span") or "intra"
     time_s = _optional_float(_cell(row, "time_s"), "time_s")
     if time_s is None:
         raise FrameworkError("缺少 time_s")
     return StageObservation(
         load=load,
-        split=StageSplit(kind, degree, micro),
+        split=StageSplit(kind, degree, micro, span),
         time_s=time_s,
         comm_bytes=_optional_float(_cell(row, "comm_bytes"), "comm_bytes"),
         comm_time_s=_optional_float(_cell(row, "comm_time_s"), "comm_time_s"),

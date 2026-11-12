@@ -108,3 +108,64 @@ def token_mixer_stage(groups_follow_length: bool = False) -> StageSpec:
         "token_gemm",
         groups_follow_length=groups_follow_length,
     )
+
+
+def hstu_stages_with_elemwise(n_layers: int = 1) -> tuple[StageSpec, ...]:
+    """把 HSTU 一层拆成「投影 → 归一化 → 注意力 → 激活 → 归一化」。
+
+    与 `hstu_stages` 数值等价的前提是归一化段 fused=True（被融合进相邻 kernel，
+    整段为 0）。设 fused=False 时这些段开始占时间，用来回答「融合没生效会多多少」。
+    """
+    return (
+        StageSpec("embed", "lookup", n_layers=n_layers),
+        StageSpec("proj", "linear", n_layers=n_layers),
+        StageSpec("norm_in", "elemwise", n_layers=n_layers, fused=True),
+        StageSpec("attn", "self_attn", n_layers=n_layers),
+        StageSpec("act", "elemwise", n_layers=n_layers, fused=True),
+        StageSpec("norm_out", "elemwise", n_layers=n_layers, fused=True),
+    )
+
+
+def hstu_stages_tiled(n_layers: int = 1, block: int = 128) -> tuple[StageSpec, ...]:
+    """自注意力改用 tile 计数（块数），替代 L 的幂。块大小由实现登记。"""
+    return (
+        StageSpec("embed", "lookup", n_layers=n_layers),
+        StageSpec("proj", "linear", n_layers=n_layers),
+        StageSpec(
+            "attn",
+            "self_attn",
+            n_layers=n_layers,
+            model="tile",
+            block_m=block,
+            block_n=block,
+        ),
+    )
+
+
+def moe_ffn_stages(
+    n_layers: int = 1,
+    n_exp: int = 64,
+    topk: int = 6,
+    renorm: int = 0,
+    span: str = "intra",
+) -> tuple[StageSpec, ...]:
+    """MoE 的一层：门控 → 分发 → 专家 FFN → 合并 → 逐元素。
+
+    分发的通信量走 ep 切分（`StageSplit("ep", degree, span=span)`）的 τ + v·V，
+    本段只记路由与搬运。`span` 决定用机内还是跨机的每字节代价。
+    """
+    return (
+        StageSpec("gate", "moe_gate", n_layers=n_layers, renorm=renorm),
+        StageSpec("dispatch", "moe_comm", n_layers=n_layers),
+        StageSpec("expert_ffn", "linear", n_layers=n_layers),
+        StageSpec("combine", "moe_comm", n_layers=n_layers),
+        StageSpec("act", "elemwise", n_layers=n_layers, fused=True),
+    )
+
+
+def retrieval_stages(n_layers: int = 1) -> tuple[StageSpec, ...]:
+    """召回一步：用户向量与全库向量打分。N_item 是主项，不是 L。"""
+    return (
+        StageSpec("user_tower", "linear", n_layers=n_layers, token_axis="query"),
+        StageSpec("score", "score_gemm", n_layers=n_layers),
+    )

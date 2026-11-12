@@ -85,6 +85,35 @@ class SplitReport:
     # 样本里只有一个并行度时记下来，预测可以不再另传 plan。多个并行度时为空。
     degree: int | None = None
     n_microbatches: int | None = None
+    # 样本含跨机通信时单列的一档。机内与跨机的每字节代价差约一个量级。
+    v_cross_s_per_byte: float | None = None
+
+    def v_for_span(self, span: str) -> float:
+        if span == "cross" and self.v_cross_s_per_byte is not None:
+            return self.v_cross_s_per_byte
+        return self.v_s_per_byte
+
+
+@dataclass(frozen=True)
+class NetworkFacts:
+    """网络层的固定开销。b 是网络级量，不该逐段拟合。
+
+    kernel 数由结构算出：每个阶段 n_layers × kernels_per_layer，融合段不计。
+    """
+
+    fixed_s: float = 0.0
+    dispatch_s: float = 0.0
+    sync_s: float = 0.0
+    n_sync: int = 1
+
+    def __post_init__(self) -> None:
+        if self.fixed_s < 0.0 or self.dispatch_s < 0.0 or self.sync_s < 0.0:
+            raise FrameworkError("网络层的固定开销不能为负")
+        if self.n_sync < 0:
+            raise FrameworkError("同步次数不能为负")
+
+    def total(self, n_kernel: int) -> float:
+        return self.fixed_s + self.dispatch_s * n_kernel + self.sync_s * self.n_sync
 
 
 @dataclass(frozen=True)
@@ -104,6 +133,10 @@ class StageEstimate:
 class NetworkEstimate:
     time_s: float
     stages: tuple[tuple[str, StageEstimate], ...]
+    # 网络层固定开销：kernel 数 × 单 kernel 下发。各段自己的截距若已提到网络层，
+    # 段内 intercept 列为 0，这里补上。
+    network_s: float = 0.0
+    n_kernel: int = 0
 
 
 def stage_time(
@@ -117,16 +150,24 @@ def stage_time(
     v_s_per_byte: float = 0.0,
     overlap: bool = False,
     uncovered_s: float = 0.0,
+    v_cross_s_per_byte: float | None = None,
 ) -> tuple[float, float, float]:
-    """返回总时间、计算时间、通信时间。"""
+    """返回总时间、计算时间、通信时间。
+
+    split.span == "cross" 且给了 v_cross_s_per_byte 时，按字节代价换成跨机那一档。
+    """
     if tau_s < 0.0 or v_s_per_byte < 0.0 or uncovered_s < 0.0:
         raise FrameworkError("τ、v 和未掩盖时间都不能为负")
     compute, _, _ = compute_parts(spec, coefficients, load, split, kappa)
     if split.kind == "none":
-        if compute <= 0.0:
+        # 融合进相邻 kernel 的段整段为 0，这是正常的；其余算子为 0 说明系数漏了。
+        if compute <= 0.0 and not spec.fused:
             raise FrameworkError(f"{spec.name} 的预测时间为 0")
         return compute, compute, 0.0
-    comm = tau_s + v_s_per_byte * volume_bytes(spec, load, split)
+    v_used = v_s_per_byte
+    if split.span == "cross" and v_cross_s_per_byte is not None:
+        v_used = v_cross_s_per_byte
+    comm = tau_s + v_used * volume_bytes(spec, load, split)
     total = max(compute, comm) + uncovered_s if overlap else compute + comm
     if total <= 0.0:
         raise FrameworkError(f"{spec.name} 的预测时间为 0")
@@ -172,6 +213,11 @@ def complexity_grid(spec: StageSpec, base: StageLoad | None = None) -> list[Stag
         _push(loads, base.varied(n_id=n_id))
     for n_head in (1, 2, 4, 8):
         _push(loads, base.varied(n_head=n_head))
+    # 补登记的两条轴：专家数与商品数。它们的成本不是 L 的幂，必须单独扫。
+    for n_exp in (16, 64, 256):
+        _push(loads, base.varied(n_exp=n_exp))
+    for n_item in (128, 1024, 8192):
+        _push(loads, base.varied(n_item=n_item))
     for width in (32, 64, 128, 256):
         ratio = width / base.width
         _push(
@@ -274,7 +320,11 @@ def fit_split(
         offsets.append(offset)
         volumes.append(volume_bytes(spec, obs.load, obs.split))
         measured.append(obs.time_s)
-    names, rows = _split_columns(kappa_column, volumes)
+    names, rows = _split_columns(kappa_column, volumes, [obs.split.span for obs in observations])
+    span_fit = len({obs.split.span for obs in observations}) > 1
+    if span_fit:
+        # 两档 v 同时估需要至少 tau + v@intra + v@cross 三个独立样本。
+        pass
     if len(observations) < len(names):
         theta = [0.0] * len(names)
         identified = False
@@ -290,22 +340,34 @@ def fit_split(
     values = {name: value for name, value in zip(names, theta)}
     median_time = sorted(measured)[len(measured) // 2]
     inactive: list[str] = []
-    for name in ("kappa", "tau", "v"):
+    span_of_name = {name: name.split("@", 1)[1] for name in names if "@" in name}
+    for name in ("kappa", "tau", "v", "v@intra", "v@cross"):
         if name not in values:
-            inactive.append(name)
+            if name in ("kappa", "tau", "v"):
+                inactive.append(name)
             continue
-        column = {"kappa": kappa_column, "tau": [1.0] * len(measured), "v": volumes}[name]
+        if name == "kappa":
+            column = kappa_column
+        elif name == "tau":
+            column = [1.0] * len(measured)
+        else:
+            column = [
+                value if span_of_name.get(name) in (None, observations[i].split.span) else 0.0
+                for i, value in enumerate(volumes)
+            ]
         peak = max((abs(value) for value in column), default=1.0) or 1.0
         if values[name] * peak < 1e-5 * median_time:
             values[name] = 0.0
             inactive.append(name)
     kappa = values.get("kappa", 0.0)
     tau = values.get("tau", 0.0)
-    v_byte = values.get("v", 0.0)
+    v_byte = values.get("v", values.get("v@intra", 0.0))
+    v_cross = values.get("v@cross")
     volume_matches, _volume_mape = _volume_agreement(spec, observations)
     overlap = False
     uncovered = 0.0
-    if all(obs.comm_time_s is not None for obs in observations):
+    # 两档 v 时不做重叠估计：max(compute, comm) 的自由度与两档 v 会互相吸收。
+    if not span_fit and all(obs.comm_time_s is not None for obs in observations):
         overlap, uncovered, kappa, tau, v_byte, train_mape = _choose_overlap(
             spec,
             coefficients,
@@ -334,6 +396,7 @@ def fit_split(
         reason=reason,
         degree=degrees.pop() if len(degrees) == 1 else None,
         n_microbatches=micros.pop() if len(micros) == 1 else None,
+        v_cross_s_per_byte=v_cross,
     )
 
 
@@ -357,7 +420,7 @@ def predict_stage(
         split,
         kappa=split_fit.kappa,
         tau_s=split_fit.tau_s,
-        v_s_per_byte=split_fit.v_s_per_byte,
+        v_s_per_byte=split_fit.v_for_span(split.span),
         overlap=split_fit.overlap,
         uncovered_s=split_fit.uncovered_s,
     )
@@ -379,17 +442,29 @@ def predict_stage(
     )
 
 
+def kernel_count(stages: tuple[StageSpec, ...]) -> int:
+    """结构里这一批要下发多少个 kernel。融合段不计，是 b 的唯一自变量。"""
+    return sum(
+        spec.n_layers * spec.kernels_per_layer for spec in stages if not spec.fused
+    )
+
+
 def predict_network(
     stages: tuple[StageSpec, ...],
     complexities: dict[str, ComplexityReport],
     split_fits: dict[str, SplitReport],
     load: StageLoad,
     plan: dict[str, StageSplit] | None = None,
+    network: NetworkFacts | None = None,
 ) -> NetworkEstimate:
     """按阶段相加。plan 里写了具体切分就用它；缺省或写了不切分时，用该阶段的拟合。
 
     拟合只含一个并行度时，degree 来自样本。含多个并行度而又没在 plan 里
     写明时直接报错，不再把切分悄悄当成 none。
+
+    给了 network 时，另加一项网络级固定开销：kernel 数 × 单 kernel 下发。
+    各段若把 intercept 提到网络层（intercept_mode="network"），段内那列为 0，
+    这一项就是唯一的 b。
     """
     plan = plan or {}
     pieces: list[tuple[str, StageEstimate]] = []
@@ -405,7 +480,14 @@ def predict_network(
         else:
             split = StageSplit("none")
         pieces.append((spec.name, predict_stage(spec, complexities[spec.name], load, split, fit)))
-    return NetworkEstimate(sum(piece.time_s for _, piece in pieces), tuple(pieces))
+    n_kernel = kernel_count(stages)
+    network_s = network.total(n_kernel) if network is not None else 0.0
+    return NetworkEstimate(
+        sum(piece.time_s for _, piece in pieces) + network_s,
+        tuple(pieces),
+        network_s,
+        n_kernel,
+    )
 
 
 def _seed_bound_axes(spec: StageSpec, base: StageLoad) -> StageLoad:
@@ -444,9 +526,11 @@ def _push(loads: list[StageLoad], load: StageLoad) -> None:
 
 
 def _matches_operator(spec: StageSpec, coefficients: dict[str, float]) -> bool:
+    if primary_term(spec) in coefficients:
+        return True
     if spec.operator == "self_attn":
         return "self_attn" in coefficients or "attn_linear" in coefficients
-    return PRIMARY_TERM[spec.operator] in coefficients
+    return False
 
 
 def _model_rank(spec: StageSpec, item: tuple[dict[str, float], float]) -> tuple:
@@ -609,7 +693,9 @@ def _width_slope(observations: list[StageObservation]) -> float | None:
 def _split_columns(
     kappa_column: list[float],
     volumes: list[float],
+    spans: list[str] | None = None,
 ) -> tuple[list[str], list[list[float]]]:
+    """切分拟合的列。样本含两种通信跨度时，v 拆成机内与跨机两档。"""
     names: list[str] = []
     columns: list[list[float]] = []
     if any(abs(value) > 0.0 for value in kappa_column):
@@ -617,7 +703,14 @@ def _split_columns(
         columns.append(kappa_column)
     names.append("tau")
     columns.append([1.0] * len(kappa_column))
-    if any(abs(value) > 0.0 for value in volumes):
+    distinct = sorted(set(spans)) if spans else []
+    if len(distinct) > 1:
+        for span in distinct:
+            column = [value if (spans or [])[i] == span else 0.0 for i, value in enumerate(volumes)]
+            if any(abs(value) > 0.0 for value in column):
+                names.append(f"v@{span}")
+                columns.append(column)
+    elif any(abs(value) > 0.0 for value in volumes):
         names.append("v")
         columns.append(volumes)
     rows = [[column[row] for column in columns] for row in range(len(kappa_column))]

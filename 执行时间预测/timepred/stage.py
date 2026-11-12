@@ -20,13 +20,35 @@
 - token_gemm token 轴矩阵乘：与组内注意力同一单项。R 固定时不读 L。
 - token_permute 转置混合：B · T · d，按字节计，没有 T²。
 
+补登记的四类（见 `文档/算子复杂度-按算子手册.md` §8–§11）：
+
+- elemwise 归一化与逐元素：linear 项按元素数算，square 项给「对 L² 分数矩阵做
+  逐元素」的情形（HSTU 对 S×S 做 SiLU）。fused=True 时整段为 0。
+- moe_gate 门控与 top-k：B · L · N_exp 的打分，加一项排序。renorm=1 时打分
+  只对 top-k 个值做，cost 从 N_exp 降到 k。
+- moe_comm 专家分发与合并：本算子只做路由与搬运，通信走 ep 切分的 τ + v·V。
+- score_gemm 全库打分：N_user · N_item · d，M 极小时为带宽 bound。
+
 切分只缩小它切得到的那一项。自注意力只切 Query、KV 留整段时，平方项除以
 并行度；Query 和 KV 都切开时，平方项除以并行度的平方。线性投影按隐藏维切
 时除以并行度。按组切开且组之间没有归约时，没有集合通信。
+
+登记位（不可拟合的事实，全部由实现决定）：
+
+- impl：实现路径 A/B/C，含义见手册各章。
+- fused：是否已被相邻 kernel 吸收。
+- sparse：块级跳过后的有效比例 σ（causal 0.5、滑窗 w/L、块对角 1/T）。
+- block_m / block_n：基本块；model="tile" 时用它替代 L 的幂次。
+- model：power（现状）或 tile（tile 计数）。
+- intercept_mode：stage（每段一个截距）或 network（截距提到网络层）。
+- comm_span：通信跨度，intra（机内）或 cross（跨机）；v 可以按跨度不同（记在 StageSplit）。
+- value_dim：注意力的 V 维；与 d_head 不同时（HSTU 的 linear_dim），L² 项宽度取二者之和。
+- kernels_per_layer：每层下发几个 kernel，网络层固定开销的唯一自变量。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -41,6 +63,10 @@ OPERATORS = (
     "group_attn",
     "token_gemm",
     "token_permute",
+    "elemwise",
+    "moe_gate",
+    "moe_comm",
+    "score_gemm",
 )
 TOKEN_AXES = ("real", "group", "fixed", "query")
 SPLIT_PATTERNS = (
@@ -54,6 +80,7 @@ SPLIT_PATTERNS = (
     "shard_r",
     "shard_t",
     "pp",
+    "ep",
 )
 FEATURE_ORDER = (
     "lookup",
@@ -64,6 +91,13 @@ FEATURE_ORDER = (
     "token_square",
     "token_linear",
     "permute",
+    "elemwise_linear",
+    "elemwise_square",
+    "gate_score",
+    "gate_sort",
+    "moe_route",
+    "score",
+    "tile",
     "intercept",
 )
 PRIMARY_TERM = {
@@ -74,6 +108,10 @@ PRIMARY_TERM = {
     "group_attn": "token_square",
     "token_gemm": "token_square",
     "token_permute": "permute",
+    "elemwise": "elemwise_linear",
+    "moe_gate": "gate_score",
+    "moe_comm": "moe_route",
+    "score_gemm": "score",
 }
 LEGAL_SPLITS = {
     "lookup": ("none", "embp"),
@@ -83,6 +121,10 @@ LEGAL_SPLITS = {
     "group_attn": ("none", "shard_r"),
     "token_gemm": ("none", "shard_r", "shard_t"),
     "token_permute": ("none", "shard_t"),
+    "elemwise": ("none",),
+    "moe_gate": ("none",),
+    "moe_comm": ("none", "ep"),
+    "score_gemm": ("none",),
 }
 # 正数表示这一项的单卡时间除以 N ** power，再乘 (1 + κ (N - 1))。
 SCALING_POWER = {
@@ -94,6 +136,8 @@ SCALING_POWER = {
     "embp": {"lookup": 1},
     "shard_r": {"token_square": 1, "token_linear": 1},
     "shard_t": {"token_square": 1, "permute": 1, "token_linear": 1},
+    # 专家并行只换位，不改本段计算量；通信单独记在 volume_bytes。
+    "ep": {},
 }
 OPERATOR_LABEL = {
     "lookup": "查表",
@@ -103,6 +147,10 @@ OPERATOR_LABEL = {
     "group_attn": "组内注意力",
     "token_gemm": "token 轴矩阵乘",
     "token_permute": "转置混合",
+    "elemwise": "归一化与逐元素",
+    "moe_gate": "门控与 top-k",
+    "moe_comm": "专家分发与合并",
+    "score_gemm": "全库打分",
 }
 SPLIT_LABEL = {
     "none": "不切分",
@@ -115,7 +163,12 @@ SPLIT_LABEL = {
     "shard_r": "按组切开",
     "shard_t": "按组内 token 切开",
     "pp": "PP",
+    "ep": "EP（专家并行）",
 }
+IMPL_PATHS = ("auto", "A", "B", "C")
+COMPLEXITY_MODELS = ("power", "tile")
+INTERCEPT_MODES = ("stage", "network")
+COMM_SPANS = ("intra", "cross")
 _LOAD_FIELDS = (
     "batch",
     "length",
@@ -129,6 +182,11 @@ _LOAD_FIELDS = (
     "hidden",
     "n_head",
     "d_head",
+    "n_exp",
+    "topk",
+    "n_user",
+    "n_item",
+    "n_probe",
 )
 
 
@@ -138,6 +196,8 @@ def scaling_power(pattern: str, term: str) -> int:
 
 def primary_term(spec: "StageSpec") -> str:
     """这一阶段在拟合里要保住的单项。SDPA 的主项是一次项，不是 L²。"""
+    if spec.model == "tile" and spec.operator in ("self_attn", "cross_attn"):
+        return "tile"
     if spec.sdpa:
         return "attn_linear"
     return PRIMARY_TERM[spec.operator]
@@ -163,6 +223,12 @@ class StageLoad:
     hidden: int = 256
     n_head: int = 4
     d_head: int = 16
+    # 补登记的两条轴：专家数与商品数。二者的成本都不是 L 的幂。
+    n_exp: int = 64
+    topk: int = 6
+    n_user: int = 1
+    n_item: int = 1000
+    n_probe: int = 0
     extras: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
@@ -193,7 +259,11 @@ def default_load() -> StageLoad:
 
 @dataclass(frozen=True)
 class StageSpec:
-    """结构里的一个阶段。axes 把算子的轴改接到别的字段，包括 extras。"""
+    """结构里的一个阶段。axes 把算子的轴改接到别的字段，包括 extras。
+
+    后七个字段是登记位（实现事实），不是拟合参数：
+    impl / fused / sparse / block_m / block_n / model / intercept_mode。
+    """
 
     name: str
     operator: str
@@ -203,6 +273,20 @@ class StageSpec:
     groups_follow_length: bool = False
     sdpa: bool = False
     axes: Mapping[str, str] | None = None
+    impl: str = "auto"
+    fused: bool = False
+    sparse: float = 1.0
+    block_m: int = 0
+    block_n: int = 0
+    model: str = "power"
+    intercept_mode: str = "stage"
+    # moe_gate 的登记位：0 = 先 softmax 再 top-k；1 = 先 top-k 再 softmax。
+    renorm: int = 0
+    # 每个阶段每层下发几个 kernel。网络层固定开销 = Σ n_layers × 这个数。
+    kernels_per_layer: int = 1
+    # 注意力的 V 维。为 0 表示与 d_head 相同；HSTU 的 linear_dim ≠ attention_dim 时
+    # L² 项的宽度是二者之和（p·v 的收缩维是 V，不是 d_head）。
+    value_dim: int = 0
 
     def __post_init__(self) -> None:
         if self.operator not in OPERATORS:
@@ -215,6 +299,31 @@ class StageSpec:
             raise FrameworkError(f"{self.name} 的层数和元素字节数至少为 1")
         if not self.name:
             raise FrameworkError("阶段名称不能为空")
+        if self.impl not in IMPL_PATHS:
+            raise FrameworkError(f"{self.name} 的实现路径只能是 {IMPL_PATHS}")
+        if self.model not in COMPLEXITY_MODELS:
+            raise FrameworkError(f"{self.name} 的复杂度模型只能是 {COMPLEXITY_MODELS}")
+        if self.intercept_mode not in INTERCEPT_MODES:
+            raise FrameworkError(f"{self.name} 的截距模式只能是 {INTERCEPT_MODES}")
+        if not 0.0 < self.sparse <= 1.0:
+            raise FrameworkError(f"{self.name} 的稀疏度要在 (0, 1] 内")
+        if self.model == "tile" and (self.block_m < 1 or self.block_n < 1):
+            raise FrameworkError(f"{self.name} 用 tile 模型时 block_m、block_n 至少为 1")
+        if self.block_m < 0 or self.block_n < 0:
+            raise FrameworkError(f"{self.name} 的基本块不能为负")
+        if self.renorm not in (0, 1):
+            raise FrameworkError(f"{self.name} 的 renorm 只能是 0 或 1")
+        if self.kernels_per_layer < 0:
+            raise FrameworkError(f"{self.name} 的每层 kernel 数不能为负")
+        if self.value_dim < 0:
+            raise FrameworkError(f"{self.name} 的 value_dim 不能为负")
+        if self.fused and self.operator not in (
+            "elemwise",
+            "token_permute",
+            "lookup",
+            "linear",
+        ):
+            raise FrameworkError(f"{self.name} 这种算子不会被相邻 kernel 吸收")
         object.__setattr__(self, "axes", dict(self.axes or {}))
         for role, field in self.axes.items():
             if not role or not field:
@@ -230,10 +339,14 @@ class StageSplit:
     kind: str
     degree: int = 1
     n_microbatches: int = 1
+    # 通信跨度。v 可按跨度不同：机内与跨机差约一个量级。
+    span: str = "intra"
 
     def __post_init__(self) -> None:
         if self.kind not in SPLIT_PATTERNS:
             raise FrameworkError(f"未知的切分 {self.kind}")
+        if self.span not in COMM_SPANS:
+            raise FrameworkError(f"通信跨度只能是 {COMM_SPANS}")
         if self.degree < 1 or self.n_microbatches < 1:
             raise FrameworkError("并行度和 micro-batch 数至少为 1")
         if self.kind == "none" and (self.degree != 1 or self.n_microbatches != 1):
@@ -279,8 +392,37 @@ def linear_tokens(spec: StageSpec, load: StageLoad) -> float:
     return load.batch * axis(spec, load, "n_query", "n_query")
 
 
+def tile_count(spec: StageSpec, load: StageLoad) -> float:
+    """按基本块数计的张量块数（含头与 batch）。
+
+    self_attn 的 Query 侧被并行度切开，KV 侧留整段；cross_attn 的 Query 侧
+    是 N_q、KV 侧是 L_kv。块数对 L 是台阶函数，不是幂。
+    """
+    if spec.block_m < 1 or spec.block_n < 1:
+        return 0.0
+    batch = float(load.batch)
+    heads = axis(spec, load, "n_head", "n_head")
+    if spec.operator == "self_attn":
+        rows = axis(spec, load, "length", "length")
+        cols = rows
+    elif spec.operator == "cross_attn":
+        rows = axis(spec, load, "n_query", "n_query")
+        cols = axis(spec, load, "length_kv", "length_kv")
+    else:
+        return 0.0
+    return batch * heads * math.ceil(rows / spec.block_m) * math.ceil(cols / spec.block_n)
+
+
 def features(spec: StageSpec, load: StageLoad) -> dict[str, float]:
-    """候选单项。拟合时只保留能降低相对误差的那些。"""
+    """候选单项。拟合时只保留能降低相对误差的那些。
+
+    登记位先进来：fused 的段整段为 0；sparse 乘在平方项上；model="tile"
+    时把 L 的幂换成块数。这三处都会改变列的取值，但不会改变列的名字。
+    """
+    zero = {name: 0.0 for name in FEATURE_ORDER}
+    if spec.fused:
+        return zero
+
     batch = float(load.batch)
     width = axis(spec, load, "width", "width")
     groups = groups_of(spec, load)
@@ -288,29 +430,69 @@ def features(spec: StageSpec, load: StageLoad) -> dict[str, float]:
     length = axis(spec, load, "length", "length")
     heads = axis(spec, load, "n_head", "n_head")
     d_head = axis(spec, load, "d_head", "d_head")
+    topk = axis(spec, load, "topk", "topk")
+    n_exp = axis(spec, load, "n_exp", "n_exp")
+    op = spec.operator
+
     # 同一次拟合只走一种注意力实现。另一种公式返回 0，列不变，不会被选进模型。
-    square = 0.0 if spec.sdpa else batch * heads * length * length * d_head
-    sdpa_term = batch * heads * length * d_head if spec.sdpa else 0.0
+    # L² 项的宽度是 d_head + value_dim：qkᵀ 收缩 d_head，p·v 收缩 V 维（HSTU 的 linear_dim）。
+    width_l2 = d_head + float(spec.value_dim)
+    tile = tile_count(spec, load)
+    use_tile = spec.model == "tile" and tile > 0.0
+    square = (
+        0.0 if (spec.sdpa or use_tile) else batch * heads * length * length * width_l2 * spec.sparse
+    )
+    sdpa_term = 0.0 if use_tile else (batch * heads * length * d_head if spec.sdpa else 0.0)
 
     # 按算子只算相关特征，不相关的返回 0。
-    op = spec.operator
-    return {
-        "lookup": batch * axis(spec, load, "n_id", "n_id") if op == "lookup" else 0.0,
-        "linear": linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden") if op == "linear" else 0.0,
-        "self_attn": square if op == "self_attn" else 0.0,
-        "attn_linear": sdpa_term if op == "self_attn" else 0.0,
-        # L_kv 与用户序列 length 是两列。接到 length 上会在改序列长度时把 KV 一起带走。
-        "cross_attn": (
-            batch
-            * axis(spec, load, "n_query", "n_query")
-            * axis(spec, load, "length_kv", "length_kv")
-            * width
-        ) if op == "cross_attn" else 0.0,
-        "token_square": batch * groups * tokens * tokens * width if op in ("group_attn", "token_gemm") else 0.0,
-        "token_linear": batch * groups * tokens * width if op in ("group_attn", "token_gemm") else 0.0,
-        "permute": batch * tokens * width if op == "token_permute" else 0.0,
-        "intercept": 1.0,
-    }
+    values = zero
+    values["lookup"] = batch * axis(spec, load, "n_id", "n_id") if op == "lookup" else 0.0
+    values["linear"] = (
+        linear_tokens(spec, load) * width * axis(spec, load, "hidden", "hidden")
+        if op == "linear"
+        else 0.0
+    )
+    values["self_attn"] = square if op == "self_attn" else 0.0
+    values["attn_linear"] = sdpa_term if op == "self_attn" else 0.0
+    # L_kv 与用户序列 length 是两列。接到 length 上会在改序列长度时把 KV 一起带走。
+    values["cross_attn"] = (
+        batch
+        * axis(spec, load, "n_query", "n_query")
+        * axis(spec, load, "length_kv", "length_kv")
+        * width
+        * spec.sparse
+        if op == "cross_attn" and not use_tile
+        else 0.0
+    )
+    values["token_square"] = (
+        batch * groups * tokens * tokens * width
+        if op in ("group_attn", "token_gemm")
+        else 0.0
+    )
+    values["token_linear"] = (
+        batch * groups * tokens * width if op in ("group_attn", "token_gemm") else 0.0
+    )
+    values["permute"] = batch * tokens * width if op == "token_permute" else 0.0
+    values["tile"] = tile if use_tile else 0.0
+
+    if op == "elemwise":
+        # 读一遍写一遍，按元素数；square 项给「对 L² 分数矩阵做逐元素」的情形。
+        values["elemwise_linear"] = 2.0 * linear_tokens(spec, load) * width
+        values["elemwise_square"] = 2.0 * batch * heads * length * length * spec.sparse
+    if op == "moe_gate":
+        # renorm=1 时先取 top-k 再 softmax，打分只对 k 个值做。
+        scored = topk if spec.renorm == 1 else n_exp
+        values["gate_score"] = batch * length * scored * width
+        values["gate_sort"] = batch * length * math.log2(max(n_exp, 2.0))
+    if op == "moe_comm":
+        values["moe_route"] = batch * length * topk
+    if op == "score_gemm":
+        items = axis(spec, load, "n_probe", "n_probe") or axis(spec, load, "n_item", "n_item")
+        values["score"] = axis(spec, load, "n_user", "n_user") * items * width
+
+    # 截距是每段的固定开销。提到网络层后这一段不再记。
+    values["intercept"] = 0.0 if spec.intercept_mode == "network" else 1.0
+    return values
 
 
 def volume_bytes(spec: StageSpec, load: StageLoad, split: StageSplit) -> float:
@@ -353,6 +535,10 @@ def volume_bytes(spec: StageSpec, load: StageLoad, split: StageSplit) -> float:
         else:
             count = batch * groups_of(spec, load) * tokens
         return per_rank * layers * count * width * elem
+    if split.kind == "ep":
+        # 每个 token 发给 top-k 个专家，落到同号的概率 1/EP，其余跨号。
+        topk = axis(spec, load, "topk", "topk")
+        return per_rank * layers * batch * length * topk * width * elem
     if split.kind == "pp":
         return (degree - 1.0) * linear_tokens(spec, load) * width * elem
     raise FrameworkError(f"{split.kind} 没有通信体积")
